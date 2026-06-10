@@ -1,0 +1,17 @@
+{
+  "name": "gladiator3",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "three": "^0.165.0",
+    "@dimforge/rapier3d-compat": "^0.12.0"
+  },
+  "devDependencies": {
+    "vite": "^5.2.0"
+  }
+}

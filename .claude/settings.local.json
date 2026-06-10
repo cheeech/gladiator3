@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(head *)",
+      "Bash(npm install *)",
+      "Bash(npm run *)",
+      "Bash(curl -s http://localhost:5174)",
+      "Bash(curl -s \"http://localhost:5174/src/main.js\")",
+      "Bash(curl -s \"http://localhost:5174/src/game.js\")",
+      "PowerShell(Remove-Item *)",
+      "PowerShell(node \"C:\\\\Users\\\\cheng\\\\Documents\\\\repositories\\\\gladiator3\\\\test\\\\smoke.js\")",
+      "PowerShell(node \"C:\\\\Users\\\\cheng\\\\Documents\\\\repositories\\\\gladiator3\\\\test\\\\pendulum.js\")",
+      "PowerShell(node \"C:\\\\Users\\\\cheng\\\\Documents\\\\repositories\\\\gladiator3\\\\test\\\\vibration.js\")",
+      "PowerShell(node \"C:\\\\Users\\\\cheng\\\\Documents\\\\repositories\\\\gladiator3\\\\test\\\\vibration.js\" 2>&1 | Select-Object -First 24)",
+      "PowerShell(git *)"
+    ]
+  }
+}

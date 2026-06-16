@@ -215,7 +215,8 @@ export class Game {
   }
 
   // Swing path from direction keys. aimYaw: positive = screen-left.
-  // A/D = blade travels left/right, W = overhead chop, S = thrust.
+  // A/D = blade travels left/right, W = overhead chop, S = thrust,
+  // S + A/D = low sweep (scythes the blade low — reaches downed/crawling foes).
   _swingPoses(basePitch) {
     const left     = this.input.isDown('KeyA', 'ArrowLeft');
     const right    = this.input.isDown('KeyD', 'ArrowRight');
@@ -229,6 +230,15 @@ export class Game {
     if (left)  d -= 1;
 
     if (thrust) {
+      if (d !== 0) {
+        // Low sweep: cock the blade low to one side, then scythe it across and
+        // down with extended reach — the reliable way to hit a foe on the
+        // ground, or to chop at a standing opponent's legs.
+        return {
+          windup: { yaw:  1.4 * d, pitch: basePitch - 0.20, reach: 0.50 },
+          strike: { yaw: -1.2 * d, pitch: basePitch - 0.85, reach: THRUST_REACH },
+        };
+      }
       return {
         windup: { yaw: 0.15, pitch: basePitch + 0.05 },
         strike: { yaw: 0.00, pitch: basePitch, thrust: true },
@@ -298,13 +308,31 @@ export class Game {
 
     if (victim === this.player) this._screenShake();
 
+    // Right-side feed: every damaging hit logs amount + body part
+    this._showDamage(dmg, part, victim === this.player ? 'to-player' : 'to-enemy');
+
     if (dead) {
       this._showLabel(who === 'player' ? 'FATAL BLOW!' : 'SLAIN!', '#e74c3c');
     } else if (severed) {
       this._showLabel(`${part.replace(/_/g, ' ').toUpperCase()} SEVERED!`, '#e74c3c');
-    } else if (who === 'player') {
-      this._showLabel(`${Math.round(dmg)}`, '#f0c040');
     }
+  }
+
+  _showDamage(dmg, part, cls) {
+    const feed = document.getElementById('damage-feed');
+    if (!feed) return;
+    const el = document.createElement('div');
+    el.className = `dmg-entry ${cls}`;
+    el.innerHTML =
+      `<span class="amt">-${Math.round(dmg)}</span>` +
+      `<span class="part">${part.replace(/_/g, ' ').toUpperCase()}</span>`;
+    feed.appendChild(el);
+    // Cap the feed so it never grows unbounded
+    while (feed.childElementCount > 8) feed.firstElementChild.remove();
+    requestAnimationFrame(() => {
+      setTimeout(() => { el.style.opacity = '0'; el.style.transform = 'translateX(20px)'; }, 1200);
+      setTimeout(() => el.remove(), 1900);
+    });
   }
 
   _showLabel(text, color = '#f0c040') {

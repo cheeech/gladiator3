@@ -63,6 +63,21 @@
       font-size: 12px; color: #666; letter-spacing: 2px; pointer-events: none; z-index: 10;
     }
 
+    #damage-feed {
+      position: fixed; top: 80px; right: 20px;
+      display: flex; flex-direction: column; align-items: flex-end;
+      gap: 4px; pointer-events: none; z-index: 15;
+    }
+    .dmg-entry {
+      font-family: Georgia, serif; font-weight: bold; white-space: nowrap;
+      text-shadow: 0 1px 6px #000; opacity: 1;
+      transition: opacity 0.6s ease, transform 0.6s ease;
+    }
+    .dmg-entry .amt { font-size: 22px; }
+    .dmg-entry .part { font-size: 11px; letter-spacing: 1px; color: #bbb; margin-left: 6px; }
+    .dmg-entry.to-enemy  .amt { color: #f0c040; }
+    .dmg-entry.to-player .amt { color: #e74c3c; }
+
     #crosshair {
       position: fixed; top: 50%; left: 50%;
       transform: translate(-50%, -50%);
@@ -104,6 +119,7 @@
       <li><span>+ A / D</span> Cut left / right</li>
       <li><span>+ W</span> Overhead chop</li>
       <li><span>+ S</span> Thrust</li>
+      <li><span>+ S &amp; A / D</span> Low sweep (hit downed foes)</li>
       <li><span>no direction</span> Draw back → straight stab</li>
     </ul>
     <p class="sub">Everything is physics. Your blade only cuts as hard as you swing it.</p>
@@ -121,6 +137,7 @@
     </div>
   </div>
 
+  <div id="damage-feed"></div>
   <div id="crosshair"></div>
   <div id="swing-indicator"><div class="arrow" id="swing-arrow"></div></div>
   <div id="message"></div>

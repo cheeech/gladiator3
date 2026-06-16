@@ -33,6 +33,13 @@ const JOINTS = [
 const VITAL = new Set(['pelvis', 'torso', 'head']);
 const MAX_TOTAL_HP = Object.values(PARTS).reduce((s, p) => s + p.hp, 0);
 
+// A limb only comes off after absorbing far more than its base HP — dismemberment
+// is sustained punishment, not one lucky cut. Total damage to sever a non-vital
+// part = hp * SEVER_MARGIN, but never less than SEVER_FLOOR (a single max hit = 60),
+// so no limb can ever be severed by one blow.
+const SEVER_MARGIN = 2.5;
+const SEVER_FLOOR  = 75;
+
 // Controller gains
 const LEVITATE_KP   = 1200;
 const LEVITATE_KD   = 130;
@@ -54,6 +61,12 @@ const SWORD_T_MAX   = 40;
 
 const KNOCK_THRESHOLD = 40;
 const PELVIS_TARGET_H = 1.0;
+
+// Prone crawl after a leg is lost — dragging yourself is slow and clumsy.
+const CRAWL_SPEED = 1.2;   // m/s
+const CRAWL_KP    = 70;
+const CRAWL_MAX   = 130;
+const CRAWL_CHEST_H = 0.55; // torso centre height when propped on the ground
 
 const _v1 = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
@@ -87,6 +100,7 @@ export class Ragdoll {
     this.joints   = {};      // part -> joint connecting it to its parent
     this.knockTimer = 0;
     this.impactAccum = 0;
+    this.downed     = false;  // true once a leg is severed — can no longer stand
     this._inertia   = {};   // per-part approximate angular inertia
 
     this._hasWeapon = hasWeapon;
@@ -218,6 +232,11 @@ export class Ragdoll {
     const pt = pelvis.translation();
     const pv = pelvis.linvel();
 
+    // A leg has been cut off — no standing. Stay prone and crawl. The sword
+    // control below still runs, so he can keep fighting from the ground.
+    if (this.downed) {
+      this._crawl(dt, cmd, pelvis, torso, pv);
+    } else {
     // ── Levitation: spring pelvis toward standing height (+gravity feedforward)
     const weight = 48 * 9.81;
     let fy = weight + LEVITATE_KP * (PELVIS_TARGET_H - pt.y) - LEVITATE_KD * pv.y;
@@ -302,6 +321,8 @@ export class Ragdoll {
       }
     }
 
+    }
+
     // ── Sword PD control — the Half Sword part
     if (this.swordBody && this.swordArmIntact) {
       const reach = cmd.reach ?? (cmd.thrust ? 0.80 : 0.52);
@@ -357,6 +378,52 @@ export class Ragdoll {
     }
   }
 
+  // Prone crawl after losing a leg: no levitation (gravity keeps him down),
+  // a slow horizontal drag toward the move direction, the chest propped up
+  // just enough to aim, and weak yaw so he can still turn toward his target.
+  _crawl(dt, cmd, pelvis, torso, pv) {
+    // Slow drag toward the intended direction (input speed renormalised down).
+    const len = Math.hypot(cmd.vx, cmd.vz);
+    let tvx = 0, tvz = 0;
+    if (len > 0.01) { tvx = (cmd.vx / len) * CRAWL_SPEED; tvz = (cmd.vz / len) * CRAWL_SPEED; }
+    let fx = CRAWL_KP * (tvx - pv.x);
+    let fz = CRAWL_KP * (tvz - pv.z);
+    const fl = Math.hypot(fx, fz);
+    if (fl > CRAWL_MAX) { fx *= CRAWL_MAX / fl; fz *= CRAWL_MAX / fl; }
+    pelvis.applyImpulse({ x: fx * dt, y: 0, z: fz * dt }, true);
+
+    // Gentle chest prop — keeps the torso/head off the dirt so he can swing,
+    // but far too weak to lift him back onto a (missing) leg.
+    const tt = torso.translation();
+    const tv = torso.linvel();
+    let tfy = 120 * (CRAWL_CHEST_H - tt.y) - 24 * tv.y;
+    tfy = Math.max(-40, Math.min(120, tfy));
+    torso.applyImpulse({ x: 0, y: tfy * dt, z: 0 }, true);
+
+    // Weak yaw toward the target so he can still face his foe.
+    const dx = Math.sin(cmd.targetYaw), dz = Math.cos(cmd.targetYaw);
+    for (const b of [torso, pelvis]) {
+      const r = b.rotation();
+      _q.set(r.x, r.y, r.z, r.w);
+      _v1.set(0, 0, 1).applyQuaternion(_q);
+      const cross = _v1.z * dx - _v1.x * dz;
+      const dot   = _v1.x * dx + _v1.z * dz;
+      const err   = Math.atan2(cross, dot);
+      const wy = b.angvel().y;
+      let ty = YAW_KP * 0.4 * err - YAW_KD * 0.4 * wy;
+      ty = Math.max(-YAW_MAX * 0.4, Math.min(YAW_MAX * 0.4, ty));
+      b.applyTorqueImpulse({ x: 0, y: ty * dt, z: 0 }, true);
+    }
+
+    // Arena containment still applies while crawling.
+    const pt = pelvis.translation();
+    const rad = Math.hypot(pt.x, pt.z);
+    if (rad > 9.3) {
+      const k = (rad - 9.3) * 220 / rad;
+      pelvis.applyImpulse({ x: -pt.x * k * dt, y: 0, z: -pt.z * k * dt }, true);
+    }
+  }
+
   // Returns { severed, dead }
   applyDamage(part, dmg) {
     if (this.detached.has(part)) return { severed: false, dead: false };
@@ -365,11 +432,16 @@ export class Ragdoll {
     this.impactAccum += dmg;
 
     let severed = false, dead = false;
-    if (this.hp[part] <= 0) {
-      if (VITAL.has(part)) {
+    if (VITAL.has(part)) {
+      if (this.hp[part] <= 0) {
         if (part === 'head' && this.joints['head']) this._sever('head');
         if (this.alive) { this._die(); dead = true; }
-      } else {
+      }
+    } else {
+      // Sever only once the limb has soaked up its full sever requirement.
+      const taken = PARTS[part].hp - this.hp[part];
+      const need  = Math.max(PARTS[part].hp * SEVER_MARGIN, SEVER_FLOOR);
+      if (taken >= need) {
         this._sever(part);
         severed = true;
       }
@@ -385,6 +457,7 @@ export class Ragdoll {
   _sever(part) {
     if (this.detached.has(part)) return;
     this.detached.add(part);
+    if (part.includes('leg')) this.downed = true;  // can't stand on a stump
     const joint = this.joints[part];
     if (joint) {
       this.physics.removeJoint(joint);

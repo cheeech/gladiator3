@@ -7,6 +7,8 @@ const SWING_STYLES = [
   { name: 'cut_l',    windup: { yaw:  1.4, pitch:  0.45 }, strike: { yaw: -1.2, pitch:  0.0  } },
   { name: 'overhead', windup: { yaw:  0.1, pitch:  1.25 }, strike: { yaw:  0.0, pitch: -0.55 } },
   { name: 'thrust',   windup: { yaw:  0.0, pitch:  0.15 }, strike: { yaw:  0.0, pitch:  0.10 }, thrust: true },
+  { name: 'low_r',    windup: { yaw: -1.3, pitch: -0.20 }, strike: { yaw:  1.1, pitch: -0.85 } },
+  { name: 'low_l',    windup: { yaw:  1.3, pitch: -0.20 }, strike: { yaw: -1.1, pitch: -0.85 } },
 ];
 
 const GUARD = { yaw: 0.35, pitch: 0.25 };
@@ -51,7 +53,7 @@ export class EnemyAI {
         }
         this._aimToward(GUARD, dt, 4);
         if (dist < 1.9 && this.player.alive) {
-          this.style = SWING_STYLES[Math.floor(Math.random() * SWING_STYLES.length)];
+          this.style = this._pickStyle();
           this.state = 'WINDUP';
           this.timer = 0.30 + Math.random() * 0.20;
         }
@@ -84,6 +86,15 @@ export class EnemyAI {
     }
 
     return { vx, vz, targetYaw, aimYaw: this.aimYaw, aimPitch: this.aimPitch, thrust };
+  }
+
+  // Against a downed/crawling foe, mostly swing low to actually connect.
+  _pickStyle() {
+    const lowStyles = SWING_STYLES.filter(s => s.name.startsWith('low_'));
+    if (this.player.downed && Math.random() < 0.8) {
+      return lowStyles[Math.floor(Math.random() * lowStyles.length)];
+    }
+    return SWING_STYLES[Math.floor(Math.random() * SWING_STYLES.length)];
   }
 
   _aimToward(target, dt, rate) {

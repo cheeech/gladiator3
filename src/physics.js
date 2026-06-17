@@ -41,7 +41,8 @@ export class PhysicsWorld {
   }
 
   createDynamicBox({ pos, rot, half, mass, linDamp = 0.15, angDamp = 1.2,
-                     friction = 0.6, collisionGroups, events = true }) {
+                     friction = 0.6, restitution = 0.0, ccd = false,
+                     collisionGroups, events = true }) {
     const { RAPIER } = this;
     let desc = RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(pos.x, pos.y, pos.z)
@@ -49,12 +50,15 @@ export class PhysicsWorld {
       .setAngularDamping(angDamp)
       .setCanSleep(false);
     if (rot) desc = desc.setRotation(rot);
+    // Continuous collision detection — thin, fast-swung blades would otherwise
+    // tunnel straight through each other between substeps.
+    if (ccd) desc = desc.setCcdEnabled(true);
     const body = this.world.createRigidBody(desc);
 
     let colDesc = RAPIER.ColliderDesc.cuboid(half.x, half.y, half.z)
       .setMass(mass)
       .setFriction(friction)
-      .setRestitution(0.0);
+      .setRestitution(restitution);
     if (collisionGroups !== undefined) colDesc = colDesc.setCollisionGroups(collisionGroups);
     if (events) colDesc = colDesc.setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
     const collider = this.world.createCollider(colDesc, body);

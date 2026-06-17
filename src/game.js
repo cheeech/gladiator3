@@ -6,7 +6,8 @@ import { EnemyAI }           from './ai.js';
 import { ThirdPersonCamera } from './camera.js';
 import { buildArena }        from './arena.js';
 
-const ENEMY_IDLE     = true;  // test dummy mode — enemy stands but won't fight
+const ENEMY_IDLE     = true;  // sparring mode: enemy holds ground and randomly
+                              // swings. Set false for the aggressive chasing AI.
 const PLAYER_SPEED   = 4.5;
 const GUARD_YAW      = 0.30;
 const GUARD_PITCH    = 0.25;
@@ -16,12 +17,16 @@ const SWING_REACH    = 0.62;
 const THRUST_REACH   = 0.85;
 const SWING_TIME     = 0.34;  // seconds for the strike sweep
 const MIN_HIT_SPEED  = 1.6;   // m/s — slower contacts do no damage
+const PARRY_YAW      = 0.00;  // block guard: blade raised centred in front
+const PARRY_PITCH    = 0.70;
+const PARRY_REACH    = 0.55;
 
 export class Game {
-  constructor(RAPIER, input, onGameOver) {
+  constructor(RAPIER, input, onGameOver, { auto = false } = {}) {
     this.input       = input;
     this._onGameOver = onGameOver;
     this._over       = false;
+    this.auto        = auto;   // both avatars AI-driven, player just watches
 
     this.aimYaw   = GUARD_YAW;
     this.aimPitch = GUARD_PITCH;
@@ -48,9 +53,12 @@ export class Game {
       bodyColor: 0x6b1e1e, helmetColor: 0x3a3a3a,
       bodyGroups:   groups(G_E_BODY, G_WORLD | G_P_BODY | G_P_WPN),
       weaponGroups: groups(G_E_WPN,  G_WORLD | G_P_BODY | G_P_WPN),
-      hasWeapon: !ENEMY_IDLE,   // unarmed training dummy
+      hasWeapon: true,   // armed so blades can clash
     });
-    this.ai = new EnemyAI(this.enemy, this.player);
+    // Enemy AI: sparring (stand + random swings) unless we're auto-battling,
+    // where it fights aggressively. In auto mode a second AI drives the player.
+    this.ai = new EnemyAI(this.enemy, this.player, { sparring: ENEMY_IDLE && !auto });
+    if (auto) this.playerAI = new EnemyAI(this.player, this.enemy, { sparring: false });
 
     const cam = new THREE.PerspectiveCamera(
       65, window.innerWidth / window.innerHeight, 0.1, 120
@@ -87,7 +95,8 @@ export class Game {
 
   start() {
     document.getElementById('hud').style.display       = 'flex';
-    document.getElementById('crosshair').style.display = 'block';
+    // No crosshair when you're just spectating an auto-battle.
+    document.getElementById('crosshair').style.display = this.auto ? 'none' : 'block';
     document.getElementById('lock-prompt').style.display = 'none';
     this.lastTime = performance.now();
     this.renderer.setAnimationLoop(() => this._loop());
@@ -117,10 +126,25 @@ export class Game {
     this.camera.update(this.player.pelvisPos(), mouse.dx, mouse.dy);
     this.input.flush();
 
-    this._updateAttack(dt, !!mouse.buttons[0]);
-
     // ── Player command ─────────────────────────────────────────────────────
-    {
+    if (this.auto) {
+      // Auto-battle: a second AI drives the "player" avatar — just watch.
+      this.player.updateControl(dt, this.playerAI.update(dt));
+    } else {
+      // Parry (hold RMB): raise a block guard; you can't wind up while blocking.
+      const parrying = !!mouse.buttons[2] && this.player.alive;
+      this.player.parrying = parrying;
+      if (parrying) {
+        const k = Math.min(1, dt * 12);
+        this.aimYaw   += (PARRY_YAW   - this.aimYaw)   * k;
+        this.aimPitch += (PARRY_PITCH - this.aimPitch) * k;
+        this.attack.state  = 'guard';
+        this.attack.thrust = false;
+        this.attack.reach  = PARRY_REACH;
+      } else {
+        this._updateAttack(dt, !!mouse.buttons[0]);
+      }
+
       const fwd   = this.camera.forward;
       const right = this.camera.right;
       let mx = 0, mz = 0;
@@ -131,6 +155,15 @@ export class Game {
       const len = Math.hypot(mx, mz);
       const vx = len > 0 ? (mx / len) * PLAYER_SPEED : 0;
       const vz = len > 0 ? (mz / len) * PLAYER_SPEED : 0;
+
+      // Dodge (tap Space): evasive burst in the move direction, else backpedal.
+      const dodgeKey = this.input.isDown('Space');
+      if (dodgeKey && !this._dodgePrev) {
+        let ddx = mx, ddz = mz;
+        if (Math.hypot(ddx, ddz) < 1e-3) { ddx = -fwd.x; ddz = -fwd.z; }
+        this.player.tryDodge(ddx, ddz);
+      }
+      this._dodgePrev = dodgeKey;
 
       this.player.updateControl(dt, {
         vx, vz,
@@ -143,17 +176,7 @@ export class Game {
     }
 
     // ── Enemy command ──────────────────────────────────────────────────────
-    if (ENEMY_IDLE) {
-      // Stand at guard facing the player — a live physics dummy
-      const ep = this.enemy.pelvisPos(), pp = this.player.pelvisPos();
-      this.enemy.updateControl(dt, {
-        vx: 0, vz: 0,
-        targetYaw: Math.atan2(pp.x - ep.x, pp.z - ep.z),
-        aimYaw: 0.35, aimPitch: 0.25, thrust: false,
-      });
-    } else {
-      this.enemy.updateControl(dt, this.ai.update(dt));
-    }
+    this.enemy.updateControl(dt, this.ai.update(dt));
 
     // ── Physics + impact damage ───────────────────────────────────────────
     this._hitCd.player = Math.max(0, this._hitCd.player - dt);
@@ -266,15 +289,9 @@ export class Game {
   }
 
   _onContact(m1, m2) {
-    // weapon vs weapon → parry clang
+    // weapon vs weapon → physical parry: deflect both blades apart
     if (m1.kind === 'weapon' && m2.kind === 'weapon') {
-      if (this._clangCd <= 0) {
-        const s = m1.ref.swordStrikeVelocity().length();
-        if (s > 2.5) {
-          this._showLabel('CLANG!', '#cfcfcf');
-          this._clangCd = 0.4;
-        }
-      }
+      this._swordClash(m1.ref, m2.ref);
       return;
     }
 
@@ -297,7 +314,7 @@ export class Game {
     const speed     = rel.length();
     if (speed < MIN_HIT_SPEED) return;
 
-    const dmg = Math.min(60, (speed - 1.2) * 11);
+    const dmg = Ragdoll.impactDamage(speed);
     this._hitCd[who] = 0.22;
 
     const { severed, dead } = victim.applyDamage(part, dmg);
@@ -335,6 +352,45 @@ export class Game {
     });
   }
 
+  // Two blades meet: shove them apart along the line between them, scaled by
+  // how hard they met, and briefly suspend both fighters' sword control so the
+  // deflection reads as a real parry rather than being instantly re-aimed.
+  _swordClash(a, b) {
+    if (!a.swordBody || !b.swordBody) return;
+
+    const rel = a.swordStrikeVelocity().sub(b.swordStrikeVelocity()).length();
+    if (rel < 2.5) return;            // a gentle touch, not a real clash
+    if (this._clangCd > 0) return;
+    this._clangCd = 0.25;
+
+    // Separation direction (a ← away from b).
+    const ta = a.swordBody.translation();
+    const tb = b.swordBody.translation();
+    let nx = ta.x - tb.x, ny = ta.y - tb.y, nz = ta.z - tb.z;
+    const len = Math.hypot(nx, ny, nz) || 1;
+    nx /= len; ny /= len; nz /= len;
+
+    // A parry (one side blocking) braces the defender and knocks the attacker
+    // wide; an even clash just deflects both.
+    const p = Ragdoll.clashResponse(a.parrying, b.parrying);
+
+    const j  = Math.min(7, rel * 0.45);   // deflection impulse, capped
+    const up = 0.5;                        // a little lift so the blades kick up
+    a.swordBody.applyImpulse({ x:  nx * j * p.aMul, y:  ny * j * p.aMul + up, z:  nz * j * p.aMul }, true);
+    b.swordBody.applyImpulse({ x: -nx * j * p.bMul, y: -ny * j * p.bMul + up, z: -nz * j * p.bMul }, true);
+
+    // A touch of spin so they twist off each other.
+    a.swordBody.applyTorqueImpulse({ x: (Math.random() - 0.5) * j * 0.2, y: (Math.random() - 0.5) * j * 0.2, z: (Math.random() - 0.5) * j * 0.2 }, true);
+    b.swordBody.applyTorqueImpulse({ x: (Math.random() - 0.5) * j * 0.2, y: (Math.random() - 0.5) * j * 0.2, z: (Math.random() - 0.5) * j * 0.2 }, true);
+
+    a.staggerSword(p.aStag);
+    b.staggerSword(p.bStag);
+    if (p.aStam) a.stamina = Math.max(0, a.stamina - p.aStam);
+    if (p.bStam) b.stamina = Math.max(0, b.stamina - p.bStam);
+
+    this._showLabel(p.parry ? 'PARRY!' : 'CLANG!', p.parry ? '#7fd0ff' : '#cfcfcf');
+  }
+
   _showLabel(text, color = '#f0c040') {
     const el = document.createElement('div');
     el.textContent = text;
@@ -367,6 +423,14 @@ export class Game {
       `${(this.player.totalHpFraction() * 100).toFixed(1)}%`;
     document.getElementById('enemy-fill').style.width =
       `${(this.enemy.totalHpFraction() * 100).toFixed(1)}%`;
+    this._updateStamBar('player-stam', this.player);
+    this._updateStamBar('enemy-stam',  this.enemy);
+  }
+
+  _updateStamBar(id, fighter) {
+    const el = document.getElementById(id);
+    el.style.width = `${(fighter.staminaFraction() * 100).toFixed(1)}%`;
+    el.classList.toggle('tired', fighter.exhausted);
   }
 
   _checkWinLose() {
@@ -374,13 +438,13 @@ export class Game {
     const msg = document.getElementById('message');
     if (!this.player.alive) {
       this._over = true;
-      msg.textContent   = 'YOU DIED';
+      msg.textContent   = this.auto ? 'RED PREVAILS' : 'YOU DIED';
       msg.style.color   = '#e74c3c';
       msg.style.opacity = '1';
       this._onGameOver?.();
     } else if (!this.enemy.alive) {
       this._over = true;
-      msg.textContent   = 'VICTORY';
+      msg.textContent   = this.auto ? 'GOLD PREVAILS' : 'VICTORY';
       msg.style.color   = '#d4a017';
       msg.style.opacity = '1';
       this._onGameOver?.();

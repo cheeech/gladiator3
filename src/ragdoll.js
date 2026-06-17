@@ -3,9 +3,9 @@ import * as THREE from 'three';
 // Rest pose: world positions with feet at y=0, facing +Z.
 // half = collider half-extents. All metres / kg.
 const PARTS = {
-  pelvis:      { half: [0.16, 0.10, 0.12], pos: [ 0.00, 1.00, 0], mass: 7,   hp: 60 },
-  torso:       { half: [0.17, 0.22, 0.12], pos: [ 0.00, 1.32, 0], mass: 14,  hp: 80 },
-  head:        { half: [0.10, 0.12, 0.10], pos: [ 0.00, 1.72, 0], mass: 4,   hp: 30 },
+  pelvis:      { half: [0.16, 0.10, 0.12], pos: [ 0.00, 1.00, 0], mass: 7,   hp: 75 },
+  torso:       { half: [0.17, 0.22, 0.12], pos: [ 0.00, 1.32, 0], mass: 14,  hp: 95 },
+  head:        { half: [0.10, 0.12, 0.10], pos: [ 0.00, 1.72, 0], mass: 4,   hp: 45 },
   upper_arm_l: { half: [0.06, 0.14, 0.06], pos: [ 0.30, 1.32, 0], mass: 2,   hp: 25 },
   upper_arm_r: { half: [0.06, 0.14, 0.06], pos: [-0.30, 1.32, 0], mass: 2,   hp: 25 },
   lower_arm_l: { half: [0.05, 0.13, 0.05], pos: [ 0.30, 1.05, 0], mass: 1.5, hp: 20 },
@@ -39,6 +39,32 @@ const MAX_TOTAL_HP = Object.values(PARTS).reduce((s, p) => s + p.hp, 0);
 // so no limb can ever be severed by one blow.
 const SEVER_MARGIN = 2.5;
 const SEVER_FLOOR  = 75;
+
+// Impact damage from a blade contact. Lower DAMAGE_SCALE → less damage per hit
+// → longer fights. (MIN_HIT_SPEED in game.js still gates out gentle taps.)
+const DAMAGE_SCALE = 0.42;
+const DAMAGE_CAP   = 60;
+
+// Stamina: a heavy sword tires the arm. Swinging it fast and holding it raised
+// both drain stamina; lowering it and resting recovers. When it bottoms out the
+// fighter is exhausted and the blade droops until stamina climbs back up.
+const MAX_STAMINA      = 100;
+const STAM_SWING_COST  = 2.2;   // per (m/s of blade speed above the floor)·s
+const STAM_HOLD_COST   = 26;    // per (radian the blade is raised)·s
+const STAM_REGEN       = 18;    // per s while resting
+const STAM_SWING_FLOOR = 3;     // m/s below which a moving blade is "not swinging"
+const STAM_EXHAUST_AT  = 1;     // drop to here → exhausted
+const STAM_RECOVER_AT  = 35;    // must climb back to here to lift the blade again
+const STAM_DROOP_PITCH = -0.7;  // forced blade pitch while exhausted (points down)
+const STAM_TIRED_AUTH  = 0.4;   // sword controller authority while exhausted
+
+// Dodge: a quick whole-body evasive burst. Costs stamina and has a cooldown.
+const DODGE_SPEED = 6.5;   // m/s added to the whole body in the dodge direction
+const DODGE_COST  = 30;    // stamina per dodge
+const DODGE_CD    = 0.7;   // s between dodges
+
+// Parry: a well-timed block deflects the attacker's blade hard and tires them.
+const PARRY_STAM_HIT = 22;  // stamina the attacker loses on a parried blow
 
 // Controller gains
 const LEVITATE_KP   = 1200;
@@ -100,7 +126,12 @@ export class Ragdoll {
     this.joints   = {};      // part -> joint connecting it to its parent
     this.knockTimer = 0;
     this.impactAccum = 0;
-    this.downed     = false;  // true once a leg is severed — can no longer stand
+    this.downed       = false;  // true once a leg is severed — can no longer stand
+    this.swordStagger = 0;      // brief loss of sword control after a clash
+    this.stamina      = MAX_STAMINA;
+    this.exhausted    = false;  // out of stamina → blade droops until recovered
+    this.dodgeCd      = 0;      // cooldown before the next dodge
+    this.parrying     = false;  // holding a block stance this frame
     this._inertia   = {};   // per-part approximate angular inertia
 
     this._hasWeapon = hasWeapon;
@@ -170,6 +201,8 @@ export class Ragdoll {
       mass: 1.3,
       linDamp: 0.2,
       angDamp: 1.5,
+      restitution: 0.25,   // blades bounce off each other on a clash
+      ccd: true,           // don't tunnel through the other blade mid-swing
       collisionGroups: weaponGroups,
     });
     // The collider cuboid is centred on the body; we want grip at origin so
@@ -216,6 +249,43 @@ export class Ragdoll {
     return !this.detached.has('upper_arm_r') && !this.detached.has('lower_arm_r');
   }
 
+  // Suspend sword PD control briefly so a clash visibly knocks the blade aside.
+  staggerSword(t) { this.swordStagger = Math.max(this.swordStagger, t); }
+
+  // Quick evasive burst in the (dx,dz) direction. Costs stamina, has a cooldown.
+  // Returns true if the dodge fired.
+  tryDodge(dx, dz) {
+    if (this.dodgeCd > 0 || !this.alive || this.knocked || this.downed) return false;
+    if (this.stamina < DODGE_COST) return false;
+    const len = Math.hypot(dx, dz);
+    if (len < 1e-3) return false;
+    const ux = dx / len, uz = dz / len;
+    // Impulse per body = mass · Δv, so the whole frame lurches together.
+    for (const body of Object.values(this.bodies)) {
+      const m = body.mass();
+      body.applyImpulse({ x: ux * DODGE_SPEED * m, y: 0, z: uz * DODGE_SPEED * m }, true);
+    }
+    if (this.swordBody) {
+      const m = this.swordBody.mass();
+      this.swordBody.applyImpulse({ x: ux * DODGE_SPEED * m, y: 0, z: uz * DODGE_SPEED * m }, true);
+    }
+    this.stamina = Math.max(0, this.stamina - DODGE_COST);
+    this.dodgeCd = DODGE_CD;
+    return true;
+  }
+
+  // Pure resolution of a blade clash given who (if anyone) is parrying. The
+  // parrying side braces (little stagger, less pushback); the attacker is
+  // knocked wide, staggered longer, and loses stamina. Kept pure so it's
+  // testable independent of the DOM-coupled clash handler in game.js.
+  static clashResponse(aParrying, bParrying) {
+    if (aParrying && !bParrying)
+      return { aStag: 0,    bStag: 0.45, aMul: 0.6, bMul: 1.8, aStam: 0,              bStam: PARRY_STAM_HIT, parry: true };
+    if (bParrying && !aParrying)
+      return { aStag: 0.45, bStag: 0,    aMul: 1.8, bMul: 0.6, aStam: PARRY_STAM_HIT, bStam: 0,              parry: true };
+    return   { aStag: 0.18, bStag: 0.18, aMul: 1,   bMul: 1,   aStam: 0,              bStam: 0,              parry: false };
+  }
+
   pelvisPos() {
     const t = this.bodies.pelvis.translation();
     return new THREE.Vector3(t.x, t.y, t.z);
@@ -224,7 +294,10 @@ export class Ragdoll {
   // cmd: { vx, vz, targetYaw, aimYaw, aimPitch, thrust }
   updateControl(dt, cmd) {
     this.impactAccum = Math.max(0, this.impactAccum - 25 * dt);
-    if (this.knockTimer > 0) this.knockTimer -= dt;
+    if (this.knockTimer > 0)   this.knockTimer   -= dt;
+    if (this.swordStagger > 0) this.swordStagger -= dt;
+    if (this.dodgeCd > 0)      this.dodgeCd      -= dt;
+    this._updateStamina(dt);
     if (!this.alive || this.knocked) return;
 
     const pelvis = this.bodies.pelvis;
@@ -323,11 +396,17 @@ export class Ragdoll {
 
     }
 
-    // ── Sword PD control — the Half Sword part
-    if (this.swordBody && this.swordArmIntact) {
+    // ── Sword PD control — the Half Sword part.
+    // While staggered from a clash the blade swings free (pure physics), so a
+    // parry actually deflects it instead of being instantly re-aimed.
+    if (this.swordBody && this.swordArmIntact && this.swordStagger <= 0) {
+      // When exhausted the arm can't hold the blade up: force the aim downward
+      // and weaken the controller so the heavy sword sags toward the ground.
+      const auth     = this.exhausted ? STAM_TIRED_AUTH : 1;
+      const aimPitch = this.exhausted ? Math.min(cmd.aimPitch, STAM_DROOP_PITCH) : cmd.aimPitch;
       const reach = cmd.reach ?? (cmd.thrust ? 0.80 : 0.52);
       const yawT  = cmd.targetYaw + cmd.aimYaw;
-      const cp = Math.cos(cmd.aimPitch), sp = Math.sin(cmd.aimPitch);
+      const cp = Math.cos(aimPitch), sp = Math.sin(aimPitch);
       const dir = _v1.set(Math.sin(yawT) * cp, sp, Math.cos(yawT) * cp);
 
       // Shoulder world position (right shoulder local in torso frame)
@@ -353,10 +432,10 @@ export class Ragdoll {
       const sv = this.swordBody.linvel();
 
       const F = clampVec({
-        x: SWORD_KP * (targetGrip.x - grip.x) - SWORD_KD * sv.x,
-        y: SWORD_KP * (targetGrip.y - grip.y) - SWORD_KD * sv.y,
-        z: SWORD_KP * (targetGrip.z - grip.z) - SWORD_KD * sv.z,
-      }, SWORD_MAX_F);
+        x: SWORD_KP * auth * (targetGrip.x - grip.x) - SWORD_KD * sv.x,
+        y: SWORD_KP * auth * (targetGrip.y - grip.y) - SWORD_KD * sv.y,
+        z: SWORD_KP * auth * (targetGrip.z - grip.z) - SWORD_KD * sv.z,
+      }, SWORD_MAX_F * auth);
       // At the COM — applying at the grip creates a parasitic torque that
       // overwhelms the blade-alignment torque below.
       this.swordBody.applyImpulse({ x: F.x * dt, y: F.y * dt, z: F.z * dt }, true);
@@ -370,10 +449,10 @@ export class Ragdoll {
       const w  = new THREE.Vector3(sw.x, sw.y, sw.z);
       w.addScaledVector(bladeDir, -w.dot(bladeDir));   // transverse component
       const T = new THREE.Vector3()
-        .crossVectors(bladeDir, dir).multiplyScalar(SWORD_T_KP)
+        .crossVectors(bladeDir, dir).multiplyScalar(SWORD_T_KP * auth)
         .addScaledVector(w, -SWORD_T_KD);
       T.addScaledVector(bladeDir, -T.dot(bladeDir));   // strip roll torque
-      clampVec(T, SWORD_T_MAX);
+      clampVec(T, SWORD_T_MAX * auth);
       this.swordBody.applyTorqueImpulse({ x: T.x * dt, y: T.y * dt, z: T.z * dt }, true);
     }
   }
@@ -516,6 +595,38 @@ export class Ragdoll {
       lv.z + (av.x * mid.y - av.y * mid.x),
     );
   }
+
+  // Damage a blade contact deals at the given relative impact speed (m/s).
+  static impactDamage(speed) {
+    return Math.min(DAMAGE_CAP, (speed - 1.2) * 11) * DAMAGE_SCALE;
+  }
+
+  // Drain stamina for swinging the blade fast and for holding it raised; recover
+  // when resting. Exhaustion latches with hysteresis so the fighter must rest.
+  _updateStamina(dt) {
+    if (!this.swordBody || !this.swordArmIntact) {
+      this.stamina   = Math.min(MAX_STAMINA, this.stamina + STAM_REGEN * dt);
+      this.exhausted = false;
+      return;
+    }
+    const speed = this.swordStrikeVelocity().length();
+    const r = this.swordBody.rotation();
+    _q.set(r.x, r.y, r.z, r.w);
+    const bladeUp = _v1.set(0, 0, 1).applyQuaternion(_q).y;   // +1 = blade points up
+    const raised  = Math.asin(Math.max(-1, Math.min(1, bladeUp)));
+
+    let cost = 0;
+    if (speed > STAM_SWING_FLOOR) cost += (speed - STAM_SWING_FLOOR) * STAM_SWING_COST;
+    if (raised > 0.1)             cost += raised * STAM_HOLD_COST;
+
+    if (cost > 0) this.stamina = Math.max(0, this.stamina - cost * dt);
+    else          this.stamina = Math.min(MAX_STAMINA, this.stamina + STAM_REGEN * dt);
+
+    if (this.stamina <= STAM_EXHAUST_AT)      this.exhausted = true;
+    else if (this.stamina >= STAM_RECOVER_AT) this.exhausted = false;
+  }
+
+  staminaFraction() { return this.stamina / MAX_STAMINA; }
 
   totalHpFraction() {
     let sum = 0;

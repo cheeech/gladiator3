@@ -20,14 +20,19 @@
     #overlay .sub { font-size: 16px; color: #999; margin-bottom: 24px; }
     #overlay ul { list-style: none; font-size: 14px; color: #aaa; text-align: left; line-height: 2; margin-bottom: 24px; }
     #overlay ul li span { color: #d4a017; min-width: 140px; display: inline-block; }
-    #start-btn {
+    #start-btn, #demo-btn {
       padding: 12px 40px; font-family: Georgia, serif;
       font-size: 20px; letter-spacing: 4px;
       background: transparent; color: #d4a017;
       border: 2px solid #d4a017; cursor: pointer;
       transition: background 0.2s;
     }
-    #start-btn:hover { background: rgba(212,160,23,0.15); }
+    #start-btn:hover, #demo-btn:hover { background: rgba(212,160,23,0.15); }
+    #demo-btn {
+      margin-top: 14px; font-size: 15px; letter-spacing: 3px;
+      color: #aaa; border-color: #777;
+    }
+    #demo-btn:hover { background: rgba(170,170,170,0.12); }
 
     #hud {
       position: fixed; top: 0; left: 0; right: 0;
@@ -43,6 +48,9 @@
     #enemy-fill  { background: linear-gradient(90deg, #c0392b, #e74c3c); }
     #enemy-wrap  { text-align: right; }
     #enemy-wrap .bar-label { text-align: right; }
+    .stam-bg { height: 5px; margin-top: 4px; background: #1a1a1a; border: 1px solid #444; border-radius: 2px; overflow: hidden; }
+    .stam-fill { height: 100%; width: 100%; background: linear-gradient(90deg, #2980b9, #5dade2); transition: width 0.12s, background 0.2s; border-radius: 2px; }
+    .stam-fill.tired { background: linear-gradient(90deg, #b9770b, #e2a13a); }
 
     #message {
       position: fixed; top: 33%; left: 50%; transform: translateX(-50%);
@@ -116,6 +124,8 @@
       <li><span>Mouse</span> Look / aim strikes</li>
       <li><span>Hold LMB</span> Wind up the sword</li>
       <li><span>Release LMB</span> Swing</li>
+      <li><span>Hold RMB</span> Parry (block &amp; deflect)</li>
+      <li><span>Space</span> Dodge</li>
       <li><span>+ A / D</span> Cut left / right</li>
       <li><span>+ W</span> Overhead chop</li>
       <li><span>+ S</span> Thrust</li>
@@ -124,16 +134,19 @@
     </ul>
     <p class="sub">Everything is physics. Your blade only cuts as hard as you swing it.</p>
     <button id="start-btn">ENTER ARENA</button>
+    <button id="demo-btn">WATCH THEM FIGHT</button>
   </div>
 
   <div id="hud">
     <div class="bar-wrap" id="player-wrap">
       <div class="bar-label">PLAYER</div>
       <div class="bar-bg"><div class="bar-fill" id="player-fill"></div></div>
+      <div class="stam-bg"><div class="stam-fill" id="player-stam"></div></div>
     </div>
     <div class="bar-wrap" id="enemy-wrap">
       <div class="bar-label">ENEMY</div>
       <div class="bar-bg"><div class="bar-fill" id="enemy-fill"></div></div>
+      <div class="stam-bg"><div class="stam-fill" id="enemy-stam"></div></div>
     </div>
   </div>
 

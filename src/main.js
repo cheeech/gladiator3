@@ -7,11 +7,13 @@ await RAPIER.init();
 const input    = new Input();
 const overlay  = document.getElementById('overlay');
 const startBtn = document.getElementById('start-btn');
+const demoBtn  = document.getElementById('demo-btn');
 let   game     = null;
 
-startBtn.addEventListener('click', async () => {
+function startGame({ auto = false } = {}) {
   overlay.style.display = 'none';
   startBtn.disabled     = true;
+  demoBtn.disabled      = true;
 
   game = new Game(RAPIER, input, () => {
     // Game over — wait, then return to title
@@ -22,23 +24,27 @@ startBtn.addEventListener('click', async () => {
 
       const msg = document.getElementById('message');
       setTimeout(() => {
-        msg.style.opacity   = '0';
-        msg.textContent     = '';
+        msg.style.opacity     = '0';
+        msg.textContent       = '';
         overlay.style.display = 'flex';
-        startBtn.disabled   = false;
+        startBtn.disabled     = false;
+        demoBtn.disabled      = false;
       }, 1800);
     }, 2500);
-  });
+  }, { auto });
 
   game.start();
 
-  // Request pointer lock after starting so the browser allows it
-  document.body.requestPointerLock();
-});
+  // Only the playable mode captures the mouse; the auto-battle is just watched.
+  if (!auto) document.body.requestPointerLock();
+}
 
-// Re-request pointer lock if user clicks the canvas while game is running
+startBtn.addEventListener('click', () => startGame());
+demoBtn.addEventListener('click',  () => startGame({ auto: true }));
+
+// Re-request pointer lock if the user clicks the canvas while playing
 document.addEventListener('click', () => {
-  if (game && !document.pointerLockElement) {
+  if (game && !game.auto && !document.pointerLockElement) {
     document.body.requestPointerLock();
   }
 });

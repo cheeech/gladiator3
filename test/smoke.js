@@ -67,7 +67,7 @@ for (let i = 0; i < 600; i++) {
     contacts++;
     if (m1.kind === 'weapon' && m2.kind === 'part' && m1.ref !== m2.ref) {
       const speed = m1.ref.swordStrikeVelocity().length();
-      if (speed > 1.6) m2.ref.applyDamage(m2.part, (speed - 1.2) * 11);
+      if (speed > 1.6) m2.ref.applyDamage(m2.part, Ragdoll.impactDamage(speed));
     }
   });
 

@@ -85,8 +85,21 @@ const SWORD_T_KP    = 24;
 const SWORD_T_KD    = 2;
 const SWORD_T_MAX   = 40;
 
+// Shield controller — holds the left-hand shield up in a guard in front of the
+// chest, face toward the foe. Softer than the sword so it gives a little.
+const SHIELD_KP     = 190;
+const SHIELD_KD     = 32;
+const SHIELD_MAX_F  = 140;
+const SHIELD_T_KP   = 16;
+const SHIELD_T_KD   = 3;
+const SHIELD_T_MAX  = 28;
+
 const KNOCK_THRESHOLD = 40;
 const PELVIS_TARGET_H = 1.0;
+// Ducking: a crouch command (cmd.crouch 0..1) drops the whole body's target
+// heights, widening the avatar's vertical range. Combined with lateral movement
+// it lets him duck down toward the lower left/right.
+const DUCK_DROP       = 0.48;  // metres the body sinks at full crouch
 
 // Prone crawl after a leg is lost — dragging yourself is slow and clumsy.
 const CRAWL_SPEED = 1.2;   // m/s
@@ -113,7 +126,7 @@ export class Ragdoll {
   constructor(scene, physics, {
     x = 0, z = 0, facing = 0,
     bodyColor = 0xb08040, helmetColor = 0x888888,
-    bodyGroups, weaponGroups, hasWeapon = true,
+    bodyGroups, weaponGroups, hasWeapon = true, hasShield = true,
   }) {
     this.scene    = scene;
     this.physics  = physics;
@@ -132,9 +145,11 @@ export class Ragdoll {
     this.exhausted    = false;  // out of stamina → blade droops until recovered
     this.dodgeCd      = 0;      // cooldown before the next dodge
     this.parrying     = false;  // holding a block stance this frame
+    this.strikePower  = 1;      // >1 while swinging a heavy blow (set via cmd.power)
     this._inertia   = {};   // per-part approximate angular inertia
 
     this._hasWeapon = hasWeapon;
+    this._hasShield = hasShield;
     this._spawnQuat = { x: 0, y: Math.sin(facing / 2), z: 0, w: Math.cos(facing / 2) };
     this._build(x, z, bodyColor, helmetColor, bodyGroups, weaponGroups);
   }
@@ -189,6 +204,7 @@ export class Ragdoll {
     }
 
     if (this._hasWeapon) this._buildSword(x, z, weaponGroups);
+    if (this._hasShield) this._buildShield(x, z, weaponGroups);
   }
 
   _buildSword(x, z, weaponGroups) {
@@ -243,6 +259,50 @@ export class Ragdoll {
     this.swordMesh = g;
   }
 
+  _buildShield(x, z, shieldGroups) {
+    // A round shield strapped to the left forearm. Face normal is local +Z.
+    // Spawn it raised in front of the chest where the controller will hold it.
+    const R = 0.26, TH = 0.045;
+    const spawn = rotY([0.30, 1.42, 0.40], this.facing);
+    const { body, collider } = this.physics.createDynamicBox({
+      pos:  { x: x + spawn.x, y: spawn.y, z: z + spawn.z },
+      rot:  this._spawnQuat,
+      half: { x: R, y: R, z: TH },
+      mass: 0.9,           // light prop so it doesn't overload the slim forearm
+      linDamp: 0.5,
+      angDamp: 2.5,
+      friction: 0.2,       // slides freely if it ever drags on the ground
+      restitution: 0.1,
+      collisionGroups: shieldGroups,
+    });
+    this.shieldBody = body;
+    this.physics.tag(collider, { ref: this, kind: 'shield' });
+
+    // Strap: left hand (bottom of lower_arm_l) to the shield's inner face.
+    this.shieldJoint = this.physics.sphericalJoint(
+      this.bodies['lower_arm_l'], this.shieldBody,
+      { x: 0, y: -0.13, z: 0 },
+      { x: 0, y: 0, z: -TH },
+    );
+
+    // Visuals: a slightly domed disc with a rim and a central boss.
+    const g = new THREE.Group();
+    const faceMat = new THREE.MeshStandardMaterial({ color: 0x7a5a2a, metalness: 0.4, roughness: 0.5 });
+    const metalMat = new THREE.MeshStandardMaterial({ color: 0xb8b8b8, metalness: 0.9, roughness: 0.25 });
+    const disc = new THREE.Mesh(new THREE.CylinderGeometry(R, R, TH * 1.6, 24), faceMat);
+    disc.rotation.x = Math.PI / 2;   // axis along Z → flat faces forward
+    disc.castShadow = disc.receiveShadow = true;
+    g.add(disc);
+    const rim = new THREE.Mesh(new THREE.TorusGeometry(R * 0.98, 0.02, 8, 24), metalMat);
+    rim.position.z = TH * 0.4;
+    g.add(rim);
+    const boss = new THREE.Mesh(new THREE.SphereGeometry(0.06, 12, 8), metalMat);
+    boss.position.z = TH * 0.9;
+    g.add(boss);
+    this.scene.add(g);
+    this.shieldMesh = g;
+  }
+
   get knocked() { return this.knockTimer > 0; }
 
   get swordArmIntact() {
@@ -291,8 +351,9 @@ export class Ragdoll {
     return new THREE.Vector3(t.x, t.y, t.z);
   }
 
-  // cmd: { vx, vz, targetYaw, aimYaw, aimPitch, thrust }
+  // cmd: { vx, vz, targetYaw, aimYaw, aimPitch, thrust, reach, power }
   updateControl(dt, cmd) {
+    this.strikePower = cmd.power ?? 1;   // read by the contact handler on a hit
     this.impactAccum = Math.max(0, this.impactAccum - 25 * dt);
     if (this.knockTimer > 0)   this.knockTimer   -= dt;
     if (this.swordStagger > 0) this.swordStagger -= dt;
@@ -310,25 +371,31 @@ export class Ragdoll {
     if (this.downed) {
       this._crawl(dt, cmd, pelvis, torso, pv);
     } else {
-    // ── Levitation: spring pelvis toward standing height (+gravity feedforward)
+    // Ducking drops every target height so the whole body crouches down.
+    const crouch = Math.max(0, Math.min(1, cmd.crouch ?? 0));
+    const drop   = crouch * DUCK_DROP;
+
+    // ── Levitation: spring pelvis toward (ducked) standing height + gravity ff.
+    // Allow a little downward push while crouching so the duck is brisk, not a
+    // slow sag waiting on gravity.
     const weight = 48 * 9.81;
-    let fy = weight + LEVITATE_KP * (PELVIS_TARGET_H - pt.y) - LEVITATE_KD * pv.y;
-    fy = Math.max(0, Math.min(LEVITATE_MAX, fy));
+    let fy = weight + LEVITATE_KP * ((PELVIS_TARGET_H - drop) - pt.y) - LEVITATE_KD * pv.y;
+    fy = Math.max(crouch > 0.05 ? -LEVITATE_MAX * 0.4 : 0, Math.min(LEVITATE_MAX, fy));
     pelvis.applyImpulse({ x: 0, y: fy * dt, z: 0 }, true);
 
-    // Torso lift assist to straighten the spine
+    // Torso lift assist to straighten the spine (lowered target while ducking)
     const tt = torso.translation();
     const tv = torso.linvel();
-    let tfy = 300 * (1.32 - tt.y) - 50 * tv.y;
+    let tfy = 300 * ((1.32 - drop) - tt.y) - 50 * tv.y;
     tfy = Math.max(-150, Math.min(400, tfy));
     torso.applyImpulse({ x: 0, y: tfy * dt, z: 0 }, true);
 
-    // Head lift — keeps the neck from drooping
+    // Head lift — keeps the neck from drooping (lowered target while ducking)
     const head = this.bodies.head;
     if (!this.detached.has('head')) {
       const ht = head.translation();
       const hv = head.linvel();
-      let hfy = 70 * (1.72 - ht.y) - 14 * hv.y;
+      let hfy = 70 * ((1.72 - drop) - ht.y) - 14 * hv.y;
       hfy = Math.max(-60, Math.min(90, hfy));
       head.applyImpulse({ x: 0, y: hfy * dt, z: 0 }, true);
     }
@@ -455,6 +522,62 @@ export class Ragdoll {
       clampVec(T, SWORD_T_MAX * auth);
       this.swordBody.applyTorqueImpulse({ x: T.x * dt, y: T.y * dt, z: T.z * dt }, true);
     }
+
+    this._updateShield(dt, cmd);
+  }
+
+  // Hold the left-hand shield up in front of the chest, face toward the foe.
+  // The shield body is driven directly; the forearm follows through the strap.
+  _updateShield(dt, cmd) {
+    if (!this.shieldBody || !this.shieldJoint) return;   // gone or dropped
+    if (this.detached.has('lower_arm_l') || this.detached.has('upper_arm_l')) return;
+    if (!this.alive || this.knocked) return;
+
+    const torso = this.bodies.torso;
+    const tr  = torso.rotation();
+    const ttr = torso.translation();
+    _q.set(tr.x, tr.y, tr.z, tr.w);
+    const shoulder = new THREE.Vector3(0.30, 0.14, 0)
+      .applyQuaternion(_q)
+      .add(new THREE.Vector3(ttr.x, ttr.y, ttr.z));
+
+    const yaw = cmd.targetYaw;
+    const fwd = _v1.set(Math.sin(yaw), 0, Math.cos(yaw));
+    // Guard: forearm's length out in front, at roughly chest height.
+    const target = new THREE.Vector3(
+      shoulder.x + fwd.x * 0.40, ttr.y + 0.08, shoulder.z + fwd.z * 0.40,
+    );
+
+    const st = this.shieldBody.translation();
+    const sv = this.shieldBody.linvel();
+    // Deadzone: once the shield is parked on target and nearly still, stop
+    // nudging it so the strapped arm settles instead of jittering at idle.
+    const ex = target.x - st.x, ey = target.y - st.y, ez = target.z - st.z;
+    if (Math.hypot(ex, ey, ez) > 0.03 || Math.hypot(sv.x, sv.y, sv.z) > 0.1) {
+      const F = clampVec({
+        x: SHIELD_KP * ex - SHIELD_KD * sv.x,
+        y: SHIELD_KP * ey - SHIELD_KD * sv.y,
+        z: SHIELD_KP * ez - SHIELD_KD * sv.z,
+      }, SHIELD_MAX_F);
+      this.shieldBody.applyImpulse({ x: F.x * dt, y: F.y * dt, z: F.z * dt }, true);
+    }
+
+    // Point the shield face (local +Z) toward the foe.
+    const sr = this.shieldBody.rotation();
+    _q.set(sr.x, sr.y, sr.z, sr.w);
+    const faceDir = _v2.set(0, 0, 1).applyQuaternion(_q);
+    const sw = this.shieldBody.angvel();
+    const cx = faceDir.y * fwd.z - faceDir.z * fwd.y;
+    const cy = faceDir.z * fwd.x - faceDir.x * fwd.z;
+    const cz = faceDir.x * fwd.y - faceDir.y * fwd.x;
+    if (Math.hypot(cx, cy, cz) > 0.05 || Math.hypot(sw.x, sw.y, sw.z) > 0.15) {
+      const T = clampVec({
+        x: cx * SHIELD_T_KP - SHIELD_T_KD * sw.x,
+        y: cy * SHIELD_T_KP - SHIELD_T_KD * sw.y,
+        z: cz * SHIELD_T_KP - SHIELD_T_KD * sw.z,
+      }, SHIELD_T_MAX);
+      this.shieldBody.applyTorqueImpulse({ x: T.x * dt, y: T.y * dt, z: T.z * dt }, true);
+    }
   }
 
   // Prone crawl after losing a leg: no levitation (gravity keeps him down),
@@ -533,10 +656,19 @@ export class Ragdoll {
     return { severed, dead };
   }
 
+  // Unstrap the shield and let it fall away (keeps lying in the arena).
+  _dropShield() {
+    if (this.shieldJoint) {
+      this.physics.removeJoint(this.shieldJoint);
+      this.shieldJoint = null;
+    }
+  }
+
   _sever(part) {
     if (this.detached.has(part)) return;
     this.detached.add(part);
-    if (part.includes('leg')) this.downed = true;  // can't stand on a stump
+    // Lose a leg → go prone; drop the shield so it doesn't anchor the crawl.
+    if (part.includes('leg')) { this.downed = true; this._dropShield(); }
     const joint = this.joints[part];
     if (joint) {
       this.physics.removeJoint(joint);
@@ -578,6 +710,12 @@ export class Ragdoll {
       const r = this.swordBody.rotation();
       this.swordMesh.position.set(t.x, t.y, t.z);
       this.swordMesh.quaternion.set(r.x, r.y, r.z, r.w);
+    }
+    if (this.shieldBody) {
+      const t = this.shieldBody.translation();
+      const r = this.shieldBody.rotation();
+      this.shieldMesh.position.set(t.x, t.y, t.z);
+      this.shieldMesh.quaternion.set(r.x, r.y, r.z, r.w);
     }
   }
 
@@ -627,6 +765,15 @@ export class Ragdoll {
   }
 
   staminaFraction() { return this.stamina / MAX_STAMINA; }
+
+  // Per-part health, in core→extremity order, for the HUD breakdown.
+  partHealth() {
+    return Object.entries(PARTS).map(([name, def]) => ({
+      name,
+      frac:     this.detached.has(name) ? 0 : Math.max(0, Math.min(this.hp[name], def.hp)) / def.hp,
+      detached: this.detached.has(name),
+    }));
+  }
 
   totalHpFraction() {
     let sum = 0;

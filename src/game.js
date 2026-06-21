@@ -5,10 +5,12 @@ import { Ragdoll }           from './ragdoll.js';
 import { EnemyAI }           from './ai.js';
 import { ThirdPersonCamera } from './camera.js';
 import { buildArena }        from './arena.js';
+import { audio }             from './audio.js';
 
 const ENEMY_IDLE     = true;  // sparring mode: enemy holds ground and randomly
                               // swings. Set false for the aggressive chasing AI.
 const PLAYER_SPEED   = 4.5;
+const DUCK_STRAFE    = 3.5;   // extra lateral lunge speed while ducking (A/D)
 const GUARD_YAW      = 0.30;
 const GUARD_PITCH    = 0.25;
 const GUARD_REACH    = 0.52;
@@ -16,10 +18,25 @@ const WINDUP_REACH   = 0.40;  // sword pulled in close while cocked
 const SWING_REACH    = 0.62;
 const THRUST_REACH   = 0.85;
 const SWING_TIME     = 0.34;  // seconds for the strike sweep
+// Heavy swing: hold the windup (LMB) past HEAVY_CHARGE_TIME to load a big,
+// committed blow — a much longer arc, longer reach, extra stamina, and more
+// damage. A blocked heavy hit also knocks the blocking blade/shield back harder.
+const HEAVY_CHARGE_TIME = 0.40;  // hold the windup this long to charge it
+const HEAVY_SWING_TIME  = 0.46;  // the longer arc takes a touch longer to sweep
+const HEAVY_SWING_REACH = 0.98;  // arm extends much further on the heavy strike
+const HEAVY_POWER       = 2.2;   // damage / knockback multiplier when it lands
+const HEAVY_STAM_COST   = 32;    // stamina spent committing to the heavy swing
 const MIN_HIT_SPEED  = 1.6;   // m/s — slower contacts do no damage
 const PARRY_YAW      = 0.00;  // block guard: blade raised centred in front
 const PARRY_PITCH    = 0.70;
 const PARRY_REACH    = 0.55;
+// Parry steering: hold a movement key while blocking to throw the block out to
+// the side (A/D), low and down (S), or high overhead (W). Bigger arcs than the
+// old fixed centre-block so the player can cover a wide spectrum of incoming cuts.
+const PARRY_YAW_SIDE   = 1.15;  // lateral sweep of a side block (radians)
+const PARRY_LOW_PITCH  = -0.65; // a low block, blade swept down across the legs
+const PARRY_HIGH_PITCH =  1.20; // a high block raised overhead
+const PARRY_SIDE_REACH = 0.74;  // arm extends further on a side/low block
 
 export class Game {
   constructor(RAPIER, input, onGameOver, { auto = false } = {}) {
@@ -31,9 +48,11 @@ export class Game {
     this.aimYaw   = GUARD_YAW;
     this.aimPitch = GUARD_PITCH;
     // Attack state machine: guard -> windup (LMB held) -> swing (LMB released)
-    this.attack   = { state: 'guard', timer: 0, strike: null, reach: GUARD_REACH, thrust: false };
+    this.attack   = { state: 'guard', timer: 0, strike: null, reach: GUARD_REACH, thrust: false,
+                      charge: 0, heavy: false, power: 1 };
     this._hitCd   = { player: 0, enemy: 0 };
     this._clangCd = 0;
+    this.crouch   = 0;   // 0..1 duck amount, smoothed from the crouch key
 
     this._setupRenderer();
     this._setupScene();
@@ -98,8 +117,33 @@ export class Game {
     // No crosshair when you're just spectating an auto-battle.
     document.getElementById('crosshair').style.display = this.auto ? 'none' : 'block';
     document.getElementById('lock-prompt').style.display = 'none';
+    this._partBars = {
+      player: this._buildPartBars('player-parts', this.player),
+      enemy:  this._buildPartBars('enemy-parts',  this.enemy),
+    };
     this.lastTime = performance.now();
     this.renderer.setAnimationLoop(() => this._loop());
+  }
+
+  // Build one labeled mini health bar per body part; return refs for updating.
+  _buildPartBars(containerId, fighter) {
+    const container = document.getElementById(containerId);
+    container.innerHTML = '';
+    return fighter.partHealth().map(({ name }) => {
+      const row   = document.createElement('div');
+      row.className = 'part-row';
+      const label = document.createElement('span');
+      label.className   = 'pname';
+      label.textContent = name.replace(/_/g, ' ').toUpperCase();
+      const bar  = document.createElement('div');
+      bar.className = 'pbar';
+      const fill = document.createElement('div');
+      fill.className = 'pfill';
+      bar.appendChild(fill);
+      row.append(label, bar);
+      container.appendChild(row);
+      return { fill, label };
+    });
   }
 
   destroy() {
@@ -132,29 +176,34 @@ export class Game {
       this.player.updateControl(dt, this.playerAI.update(dt));
     } else {
       // Parry (hold RMB): raise a block guard; you can't wind up while blocking.
+      // Movement keys steer the block out to the side / low / high so the player
+      // can swing the parry across a wide arc to meet the incoming cut.
       const parrying = !!mouse.buttons[2] && this.player.alive;
       this.player.parrying = parrying;
       if (parrying) {
+        const pose = this._parryPose();
         const k = Math.min(1, dt * 12);
-        this.aimYaw   += (PARRY_YAW   - this.aimYaw)   * k;
-        this.aimPitch += (PARRY_PITCH - this.aimPitch) * k;
+        this.aimYaw   += (pose.yaw   - this.aimYaw)   * k;
+        this.aimPitch += (pose.pitch - this.aimPitch) * k;
         this.attack.state  = 'guard';
         this.attack.thrust = false;
-        this.attack.reach  = PARRY_REACH;
+        this.attack.reach += (pose.reach - this.attack.reach) * k;
       } else {
         this._updateAttack(dt, !!mouse.buttons[0]);
       }
 
       const fwd   = this.camera.forward;
       const right = this.camera.right;
+      const aIn = this.input.isDown('KeyA', 'ArrowLeft');
+      const dIn = this.input.isDown('KeyD', 'ArrowRight');
       let mx = 0, mz = 0;
       if (this.input.isDown('KeyW', 'ArrowUp'))    { mx += fwd.x;   mz += fwd.z;   }
       if (this.input.isDown('KeyS', 'ArrowDown'))  { mx -= fwd.x;   mz -= fwd.z;   }
-      if (this.input.isDown('KeyA', 'ArrowLeft'))  { mx -= right.x; mz -= right.z; }
-      if (this.input.isDown('KeyD', 'ArrowRight')) { mx += right.x; mz += right.z; }
+      if (aIn) { mx -= right.x; mz -= right.z; }
+      if (dIn) { mx += right.x; mz += right.z; }
       const len = Math.hypot(mx, mz);
-      const vx = len > 0 ? (mx / len) * PLAYER_SPEED : 0;
-      const vz = len > 0 ? (mz / len) * PLAYER_SPEED : 0;
+      let vx = len > 0 ? (mx / len) * PLAYER_SPEED : 0;
+      let vz = len > 0 ? (mz / len) * PLAYER_SPEED : 0;
 
       // Dodge (tap Space): evasive burst in the move direction, else backpedal.
       const dodgeKey = this.input.isDown('Space');
@@ -165,18 +214,31 @@ export class Game {
       }
       this._dodgePrev = dodgeKey;
 
+      // Duck/crouch (hold Shift or C): drop the body low. With A/D held the duck
+      // weaves hard to that side — a ducking sidestep, not just a drop.
+      const ducking = this.input.isDown('ShiftLeft', 'ShiftRight', 'KeyC');
+      this.crouch += ((ducking ? 1 : 0) - this.crouch) * Math.min(1, dt * 9);
+      const lat = (dIn ? 1 : 0) - (aIn ? 1 : 0);
+      vx += right.x * lat * DUCK_STRAFE * this.crouch;
+      vz += right.z * lat * DUCK_STRAFE * this.crouch;
+
       this.player.updateControl(dt, {
         vx, vz,
+        crouch: this.crouch,
         targetYaw: this.camera.playerFacing,
         aimYaw:    this.aimYaw,
         aimPitch:  this.aimPitch,
         thrust:    this.attack.thrust,
         reach:     this.attack.reach,
+        power:     this.attack.power,
       });
     }
 
     // ── Enemy command ──────────────────────────────────────────────────────
     this.enemy.updateControl(dt, this.ai.update(dt));
+
+    // Flash "PARRY" above whichever fighter just raised a block this frame.
+    this._announceParries();
 
     // ── Physics + impact damage ───────────────────────────────────────────
     this._hitCd.player = Math.max(0, this._hitCd.player - dt);
@@ -210,21 +272,31 @@ export class Game {
       this.aimPitch += (GUARD_PITCH - this.aimPitch) * k;
       atk.reach  = GUARD_REACH;
       atk.thrust = false;
-      if (lmb && this.player.alive) atk.state = 'windup';
+      atk.power  = 1;
+      if (lmb && this.player.alive) { atk.state = 'windup'; atk.charge = 0; atk.heavy = false; }
 
     } else if (atk.state === 'windup') {
+      // Holding the windup charges a heavy swing (needs the stamina to spend).
+      atk.charge += dt;
+      atk.heavy = atk.charge >= HEAVY_CHARGE_TIME && this.player.stamina > HEAVY_STAM_COST;
       // Re-read keys every frame so the path can be adjusted mid-windup
-      const pose = this._swingPoses(basePitch).windup;
+      const pose = this._swingPoses(basePitch, atk.heavy).windup;
       const k = Math.min(1, dt * 10);
       this.aimYaw   += (pose.yaw   - this.aimYaw)   * k;
       this.aimPitch += (pose.pitch - this.aimPitch) * k;
       atk.reach += ((pose.reach ?? WINDUP_REACH) - atk.reach) * k;
       if (!lmb) {
-        const poses = this._swingPoses(basePitch);
+        const poses = this._swingPoses(basePitch, atk.heavy);
         atk.strike = poses.strike;
         atk.thrust = !!poses.strike.thrust;
-        atk.timer  = SWING_TIME;
+        atk.timer  = atk.heavy ? HEAVY_SWING_TIME : SWING_TIME;
+        atk.power  = atk.heavy ? HEAVY_POWER : 1;
         atk.state  = 'swing';
+        if (atk.heavy) {
+          this.player.stamina = Math.max(0, this.player.stamina - HEAVY_STAM_COST);
+          const pp = this.player.pelvisPos();
+          this._flashWorldText('HEAVY!', new THREE.Vector3(pp.x, pp.y + 1.2, pp.z), '#ff8c2a', 22);
+        }
       }
 
     } else if (atk.state === 'swing') {
@@ -233,14 +305,38 @@ export class Game {
       this.aimPitch += (atk.strike.pitch - this.aimPitch) * k;
       atk.reach = atk.strike.reach ?? (atk.thrust ? THRUST_REACH : SWING_REACH);
       atk.timer -= dt;
-      if (atk.timer <= 0) { atk.state = 'guard'; atk.thrust = false; }
+      if (atk.timer <= 0) { atk.state = 'guard'; atk.thrust = false; atk.power = 1; }
     }
+  }
+
+  // Block pose while parrying, steered by the movement keys so the guard can be
+  // thrown across a wide arc. A/D sweep it far to the side, S drops it low and
+  // down, W raises it high overhead; combine for diagonal blocks. No key holds
+  // the default centred high guard.
+  _parryPose() {
+    const left  = this.input.isDown('KeyA', 'ArrowLeft');
+    const right = this.input.isDown('KeyD', 'ArrowRight');
+    const high  = this.input.isDown('KeyW', 'ArrowUp');
+    const low   = this.input.isDown('KeyS', 'ArrowDown');
+
+    let d = 0;
+    if (right) d -= 1;   // aimYaw positive = screen-left, so D (right) is negative
+    if (left)  d += 1;
+
+    let yaw   = PARRY_YAW + d * PARRY_YAW_SIDE;
+    let pitch = PARRY_PITCH;
+    let reach = d !== 0 ? PARRY_SIDE_REACH : PARRY_REACH;
+
+    if (low)  { pitch = PARRY_LOW_PITCH;  reach = PARRY_SIDE_REACH; }
+    else if (high) { pitch = PARRY_HIGH_PITCH; }
+
+    return { yaw, pitch, reach };
   }
 
   // Swing path from direction keys. aimYaw: positive = screen-left.
   // A/D = blade travels left/right, W = overhead chop, S = thrust,
   // S + A/D = low sweep (scythes the blade low — reaches downed/crawling foes).
-  _swingPoses(basePitch) {
+  _swingPoses(basePitch, heavy = false) {
     const left     = this.input.isDown('KeyA', 'ArrowLeft');
     const right    = this.input.isDown('KeyD', 'ArrowRight');
     const overhead = this.input.isDown('KeyW', 'ArrowUp');
@@ -252,46 +348,64 @@ export class Game {
     if (right) d += 1;
     if (left)  d -= 1;
 
+    let p;
     if (thrust) {
       if (d !== 0) {
         // Low sweep: cock the blade low to one side, then scythe it across and
         // down with extended reach — the reliable way to hit a foe on the
         // ground, or to chop at a standing opponent's legs.
-        return {
+        p = {
           windup: { yaw:  1.4 * d, pitch: basePitch - 0.20, reach: 0.50 },
           strike: { yaw: -1.2 * d, pitch: basePitch - 0.85, reach: THRUST_REACH },
         };
+      } else {
+        p = {
+          windup: { yaw: 0.15, pitch: basePitch + 0.05 },
+          strike: { yaw: 0.00, pitch: basePitch, thrust: true },
+        };
       }
-      return {
-        windup: { yaw: 0.15, pitch: basePitch + 0.05 },
-        strike: { yaw: 0.00, pitch: basePitch, thrust: true },
-      };
-    }
-    if (overhead) {
-      return {
+    } else if (overhead) {
+      p = {
         windup: { yaw: 0.35 * d + 0.1, pitch: basePitch + 1.15 },
         strike: { yaw: -0.90 * d,      pitch: basePitch - 0.55 },
       };
-    }
-    if (d === 0) {
+    } else if (d === 0) {
       // No direction held: pendulum backswing — pitch beyond vertical sends
       // the grip target up and behind the head, so the hand raises overhead
       // with the blade cocked back. Release whips it down into a stab.
-      return {
+      p = {
         windup: { yaw: 0.05, pitch: basePitch + 1.85, reach: 0.50 },
         strike: { yaw: 0.00, pitch: basePitch - 0.85, reach: THRUST_REACH, thrust: true },
       };
+    } else {
+      p = {
+        windup: { yaw:  1.5 * d, pitch: basePitch + 0.55 },
+        strike: { yaw: -1.3 * d, pitch: basePitch - 0.10 },
+      };
     }
-    return {
-      windup: { yaw:  1.5 * d, pitch: basePitch + 0.55 },
-      strike: { yaw: -1.3 * d, pitch: basePitch - 0.10 },
-    };
+
+    // A heavy swing cocks back further and sweeps through a much longer arc with
+    // extended reach, so the blade travels farther and faster into the target.
+    if (heavy) {
+      p.windup = { ...p.windup, yaw: p.windup.yaw * 1.55 };
+      p.strike = { ...p.strike, yaw: p.strike.yaw * 1.7, reach: HEAVY_SWING_REACH };
+    }
+    return p;
   }
 
   _onContact(m1, m2) {
     // weapon vs weapon → physical parry: deflect both blades apart
     if (m1.kind === 'weapon' && m2.kind === 'weapon') {
       this._swordClash(m1.ref, m2.ref);
+      return;
+    }
+
+    // weapon vs shield → blocked: deflect the blade, no damage
+    if ((m1.kind === 'weapon' && m2.kind === 'shield') ||
+        (m2.kind === 'weapon' && m1.kind === 'shield')) {
+      const wpn = m1.kind === 'weapon' ? m1.ref : m2.ref;
+      const shd = m1.kind === 'shield' ? m1.ref : m2.ref;
+      if (wpn !== shd) this._shieldBlock(wpn, shd);
       return;
     }
 
@@ -314,19 +428,30 @@ export class Game {
     const speed     = rel.length();
     if (speed < MIN_HIT_SPEED) return;
 
-    const dmg = Ragdoll.impactDamage(speed);
+    // A heavy swing (strikePower > 1) lands far harder than a normal cut.
+    const power = attacker.strikePower ?? 1;
+    const dmg = Ragdoll.impactDamage(speed) * power;
     this._hitCd[who] = 0.22;
 
     const { severed, dead } = victim.applyDamage(part, dmg);
 
-    // Extra shove along strike direction for drama
-    rel.normalize().multiplyScalar(dmg * 0.35);
+    // Thud of the blade biting flesh — louder for a harder hit.
+    audio.hit(dmg / 25);
+
+    // Extra shove along strike direction for drama — heavier on a powerful blow
+    rel.normalize().multiplyScalar(dmg * 0.35 * power);
     partBody.applyImpulse({ x: rel.x, y: rel.y, z: rel.z }, true);
 
     if (victim === this.player) this._screenShake();
 
     // Right-side feed: every damaging hit logs amount + body part
     this._showDamage(dmg, part, victim === this.player ? 'to-player' : 'to-enemy');
+
+    // Floating combat text right above the struck body part
+    const pt = partBody.translation();
+    this._flashWorldText(`-${Math.round(dmg)}`,
+      new THREE.Vector3(pt.x, pt.y + 0.35, pt.z),
+      victim === this.player ? '#ff6b6b' : '#ffe08a');
 
     if (dead) {
       this._showLabel(who === 'player' ? 'FATAL BLOW!' : 'SLAIN!', '#e74c3c');
@@ -363,6 +488,8 @@ export class Game {
     if (this._clangCd > 0) return;
     this._clangCd = 0.25;
 
+    audio.clash(rel / 8);             // metallic clang, louder the harder they meet
+
     // Separation direction (a ← away from b).
     const ta = a.swordBody.translation();
     const tb = b.swordBody.translation();
@@ -374,21 +501,99 @@ export class Game {
     // wide; an even clash just deflects both.
     const p = Ragdoll.clashResponse(a.parrying, b.parrying);
 
+    // Each blade is knocked back harder the more powerful the OTHER's swing was,
+    // so a heavy blow drives the blocking blade well aside.
+    const aP = a.strikePower ?? 1, bP = b.strikePower ?? 1;
     const j  = Math.min(7, rel * 0.45);   // deflection impulse, capped
     const up = 0.5;                        // a little lift so the blades kick up
-    a.swordBody.applyImpulse({ x:  nx * j * p.aMul, y:  ny * j * p.aMul + up, z:  nz * j * p.aMul }, true);
-    b.swordBody.applyImpulse({ x: -nx * j * p.bMul, y: -ny * j * p.bMul + up, z: -nz * j * p.bMul }, true);
+    const ja = j * p.aMul * bP, jb = j * p.bMul * aP;
+    a.swordBody.applyImpulse({ x:  nx * ja, y:  ny * ja + up, z:  nz * ja }, true);
+    b.swordBody.applyImpulse({ x: -nx * jb, y: -ny * jb + up, z: -nz * jb }, true);
 
     // A touch of spin so they twist off each other.
-    a.swordBody.applyTorqueImpulse({ x: (Math.random() - 0.5) * j * 0.2, y: (Math.random() - 0.5) * j * 0.2, z: (Math.random() - 0.5) * j * 0.2 }, true);
-    b.swordBody.applyTorqueImpulse({ x: (Math.random() - 0.5) * j * 0.2, y: (Math.random() - 0.5) * j * 0.2, z: (Math.random() - 0.5) * j * 0.2 }, true);
+    a.swordBody.applyTorqueImpulse({ x: (Math.random() - 0.5) * ja * 0.2, y: (Math.random() - 0.5) * ja * 0.2, z: (Math.random() - 0.5) * ja * 0.2 }, true);
+    b.swordBody.applyTorqueImpulse({ x: (Math.random() - 0.5) * jb * 0.2, y: (Math.random() - 0.5) * jb * 0.2, z: (Math.random() - 0.5) * jb * 0.2 }, true);
 
-    a.staggerSword(p.aStag);
-    b.staggerSword(p.bStag);
+    a.staggerSword(p.aStag * bP);
+    b.staggerSword(p.bStag * aP);
     if (p.aStam) a.stamina = Math.max(0, a.stamina - p.aStam);
     if (p.bStam) b.stamina = Math.max(0, b.stamina - p.bStam);
 
-    this._showLabel(p.parry ? 'PARRY!' : 'CLANG!', p.parry ? '#7fd0ff' : '#cfcfcf');
+    // Flash the clash text at the point where the blades meet
+    this._flashWorldText(p.parry ? 'PARRY!' : 'CLANG!',
+      new THREE.Vector3((ta.x + tb.x) / 2, (ta.y + tb.y) / 2 + 0.2, (ta.z + tb.z) / 2),
+      p.parry ? '#7fd0ff' : '#cfcfcf', 20);
+  }
+
+  // A blade caught on a shield: deflect it off the boss and tire the attacker,
+  // but deal no damage — the shield ate the blow. A powerful (heavy) swing both
+  // rebounds harder off the shield and drives the shield itself back.
+  _shieldBlock(attacker, defender) {
+    if (!attacker.swordBody || !defender.shieldBody) return;
+    const rel = attacker.swordStrikeVelocity().length();
+    if (rel < 2.5) return;            // a gentle touch, not a real strike
+    if (this._clangCd > 0) return;
+    this._clangCd = 0.25;
+
+    const power = attacker.strikePower ?? 1;
+    audio.block(rel / 8 * power);     // dull thunk off the shield, harder if powerful
+    const ta = attacker.swordBody.translation();
+    const tb = defender.shieldBody.translation();
+    let nx = ta.x - tb.x, ny = ta.y - tb.y, nz = ta.z - tb.z;
+    const len = Math.hypot(nx, ny, nz) || 1;
+    nx /= len; ny /= len; nz /= len;
+
+    const j = Math.min(8, rel * 0.5) * power;   // bounce the blade back off the shield
+    attacker.swordBody.applyImpulse({ x: nx * j, y: ny * j + 0.5, z: nz * j }, true);
+    attacker.swordBody.applyTorqueImpulse({
+      x: (Math.random() - 0.5) * j * 0.3,
+      y: (Math.random() - 0.5) * j * 0.3,
+      z: (Math.random() - 0.5) * j * 0.3,
+    }, true);
+    // Drive the shield (and the arm behind it) back along the line of the blow.
+    const push = Math.min(7, rel * 0.4) * power;
+    defender.shieldBody.applyImpulse({ x: -nx * push, y: -ny * push + 0.3, z: -nz * push }, true);
+
+    attacker.staggerSword(0.4 * power);
+    attacker.stamina = Math.max(0, attacker.stamina - 16);
+
+    this._flashWorldText(power > 1 ? 'BLOCKED!' : 'BLOCK',
+      new THREE.Vector3(tb.x, tb.y + 0.2, tb.z), '#9ad0ff', power > 1 ? 22 : 20);
+  }
+
+  // Flash "PARRY" above any fighter the instant it raises a block stance.
+  _announceParries() {
+    for (const f of [this.player, this.enemy]) {
+      if (f.parrying && !f._parryAnnounced) {
+        const pp = f.pelvisPos();
+        this._flashWorldText('PARRY', new THREE.Vector3(pp.x, pp.y + 1.0, pp.z), '#7fd0ff', 20);
+      }
+      f._parryAnnounced = f.parrying;
+    }
+  }
+
+  // Flash short-lived combat text anchored to a 3D world point, projected to
+  // screen space; it floats up and fades.
+  _flashWorldText(text, worldPos, color = '#fff', size = 16) {
+    const cam = this.camera.cam;
+    const v = worldPos.clone().project(cam);
+    if (v.z > 1) return;                       // behind the camera
+    const x = (v.x * 0.5 + 0.5) * window.innerWidth;
+    const y = (-v.y * 0.5 + 0.5) * window.innerHeight;
+    const el = document.createElement('div');
+    el.textContent = text;
+    el.style.cssText =
+      `position:fixed;left:${x}px;top:${y}px;` +
+      'transform:translate(-50%,-50%);' +
+      `font-family:Georgia,serif;font-size:${size}px;font-weight:bold;color:${color};` +
+      'text-shadow:0 0 6px #000,0 1px 2px #000;pointer-events:none;z-index:30;' +
+      'white-space:nowrap;transition:transform 0.7s ease-out,opacity 0.7s;';
+    document.body.appendChild(el);
+    requestAnimationFrame(() => {
+      el.style.transform = 'translate(-50%,-50%) translateY(-42px)';
+      el.style.opacity   = '0';
+    });
+    setTimeout(() => el.remove(), 750);
   }
 
   _showLabel(text, color = '#f0c040') {
@@ -419,18 +624,40 @@ export class Game {
   }
 
   _updateHUD() {
-    document.getElementById('player-fill').style.width =
-      `${(this.player.totalHpFraction() * 100).toFixed(1)}%`;
-    document.getElementById('enemy-fill').style.width =
-      `${(this.enemy.totalHpFraction() * 100).toFixed(1)}%`;
-    this._updateStamBar('player-stam', this.player);
-    this._updateStamBar('enemy-stam',  this.enemy);
+    this._updateHpBar('player-fill', 'player-hp-text', this.player);
+    this._updateHpBar('enemy-fill',  'enemy-hp-text',  this.enemy);
+    this._updateStamBar('player-stam', 'player-stam-text', this.player);
+    this._updateStamBar('enemy-stam',  'enemy-stam-text',  this.enemy);
+    this._updatePartBars(this._partBars.player, this.player);
+    this._updatePartBars(this._partBars.enemy,  this.enemy);
   }
 
-  _updateStamBar(id, fighter) {
+  _updateHpBar(fillId, textId, fighter) {
+    const frac = fighter.totalHpFraction();
+    document.getElementById(fillId).style.width = `${(frac * 100).toFixed(1)}%`;
+    document.getElementById(textId).textContent = `HP ${Math.round(frac * 100)}%`;
+  }
+
+  _updateStamBar(id, textId, fighter) {
+    const frac = fighter.staminaFraction();
     const el = document.getElementById(id);
-    el.style.width = `${(fighter.staminaFraction() * 100).toFixed(1)}%`;
+    el.style.width = `${(frac * 100).toFixed(1)}%`;
     el.classList.toggle('tired', fighter.exhausted);
+    document.getElementById(textId).textContent =
+      fighter.exhausted ? 'EXHAUSTED' : `STAM ${Math.round(frac * 100)}%`;
+  }
+
+  _updatePartBars(bars, fighter) {
+    if (!bars) return;
+    const health = fighter.partHealth();
+    for (let i = 0; i < bars.length; i++) {
+      const h = health[i];
+      const { fill, label } = bars[i];
+      fill.style.width = `${(h.frac * 100).toFixed(0)}%`;
+      // Green when healthy, shading to red as the part is worn down.
+      fill.style.background = h.detached ? '#444' : `hsl(${(h.frac * 120).toFixed(0)}, 70%, 45%)`;
+      label.classList.toggle('severed', h.detached);
+    }
   }
 
   _checkWinLose() {

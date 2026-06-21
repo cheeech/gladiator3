@@ -1,6 +1,7 @@
 import RAPIER from '@dimforge/rapier3d-compat';
 import { Game }  from './game.js';
 import { Input } from './input.js';
+import { audio } from './audio.js';
 
 await RAPIER.init();
 
@@ -14,6 +15,7 @@ function startGame({ auto = false } = {}) {
   overlay.style.display = 'none';
   startBtn.disabled     = true;
   demoBtn.disabled      = true;
+  audio.resume();   // unlock the AudioContext from this click gesture
 
   game = new Game(RAPIER, input, () => {
     // Game over — wait, then return to title

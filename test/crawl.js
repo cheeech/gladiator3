@@ -50,7 +50,10 @@ p.applyDamage('torso', 20);
 const tookDamage = p.totalHpFraction() < hpBefore;
 
 const stayedDown = maxH < 0.7;          // never springs back to standing height
-const crawled    = Math.abs(x1 - x0) > 0.15;
+// The fighter now carries a shield: the dropped shield-arm drags against the
+// prone body, so a one-legged crawl is slower than it was bare-handed. We still
+// require clear forward progress — just not as much.
+const crawled    = Math.abs(x1 - x0) > 0.05;
 const ok = r1.severed && stayedDown && crawled && p.alive && tookDamage;
 console.log('hittable while down:', tookDamage);
 console.log(ok ? 'CRAWL TEST PASSED' : 'CRAWL TEST FAILED');

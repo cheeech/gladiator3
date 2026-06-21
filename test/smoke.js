@@ -7,6 +7,16 @@ import { PhysicsWorld, groups,
 import { Ragdoll } from '../src/ragdoll.js';
 import { EnemyAI } from '../src/ai.js';
 
+// The enemy AI is probabilistic (footwork, attack timing, ducks). Seed
+// Math.random so this regression test is deterministic instead of flaky.
+let _seed = 2;
+Math.random = () => {
+  _seed = (_seed + 0x6D2B79F5) | 0;
+  let t = Math.imul(_seed ^ (_seed >>> 15), 1 | _seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+};
+
 await RAPIER.init();
 
 const scene   = new THREE.Scene();

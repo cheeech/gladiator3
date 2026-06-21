@@ -42,15 +42,31 @@
     }
     .bar-wrap { width: 220px; }
     .bar-label { font-size: 11px; color: #ccc; letter-spacing: 2px; margin-bottom: 4px; }
-    .bar-bg { height: 8px; background: #1a1a1a; border: 1px solid #444; border-radius: 2px; overflow: hidden; }
+    .bar-bg { position: relative; height: 16px; background: #1a1a1a; border: 1px solid #444; border-radius: 2px; overflow: hidden; }
     .bar-fill { height: 100%; width: 100%; transition: width 0.15s; border-radius: 2px; }
     #player-fill { background: linear-gradient(90deg, #27ae60, #2ecc71); }
     #enemy-fill  { background: linear-gradient(90deg, #c0392b, #e74c3c); }
     #enemy-wrap  { text-align: right; }
     #enemy-wrap .bar-label { text-align: right; }
-    .stam-bg { height: 5px; margin-top: 4px; background: #1a1a1a; border: 1px solid #444; border-radius: 2px; overflow: hidden; }
+    .stam-bg { position: relative; height: 13px; margin-top: 4px; background: #1a1a1a; border: 1px solid #444; border-radius: 2px; overflow: hidden; }
     .stam-fill { height: 100%; width: 100%; background: linear-gradient(90deg, #2980b9, #5dade2); transition: width 0.12s, background 0.2s; border-radius: 2px; }
     .stam-fill.tired { background: linear-gradient(90deg, #b9770b, #e2a13a); }
+    .bar-text {
+      position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 10px; font-weight: bold; color: #fff; letter-spacing: 1px;
+      text-shadow: 0 1px 2px #000, 0 0 3px #000; pointer-events: none;
+    }
+    .stam-bg .bar-text { font-size: 9px; }
+
+    .parts { margin-top: 8px; }
+    .part-row { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+    .part-row .pname { width: 84px; font-size: 9px; letter-spacing: 1px; color: #000; white-space: nowrap; }
+    .part-row .pname.severed { color: #e74c3c; text-decoration: line-through; }
+    .part-row .pbar { flex: 1; height: 4px; background: #161616; border: 1px solid #383838; border-radius: 2px; overflow: hidden; }
+    .part-row .pfill { height: 100%; width: 100%; border-radius: 2px; transition: width 0.12s, background 0.2s; }
+    #enemy-parts .part-row { flex-direction: row-reverse; }
+    #enemy-parts .part-row .pname { text-align: right; }
 
     #message {
       position: fixed; top: 33%; left: 50%; transform: translateX(-50%);
@@ -140,13 +156,15 @@
   <div id="hud">
     <div class="bar-wrap" id="player-wrap">
       <div class="bar-label">PLAYER</div>
-      <div class="bar-bg"><div class="bar-fill" id="player-fill"></div></div>
-      <div class="stam-bg"><div class="stam-fill" id="player-stam"></div></div>
+      <div class="bar-bg"><div class="bar-fill" id="player-fill"></div><span class="bar-text" id="player-hp-text"></span></div>
+      <div class="stam-bg"><div class="stam-fill" id="player-stam"></div><span class="bar-text" id="player-stam-text"></span></div>
+      <div class="parts" id="player-parts"></div>
     </div>
     <div class="bar-wrap" id="enemy-wrap">
       <div class="bar-label">ENEMY</div>
-      <div class="bar-bg"><div class="bar-fill" id="enemy-fill"></div></div>
-      <div class="stam-bg"><div class="stam-fill" id="enemy-stam"></div></div>
+      <div class="bar-bg"><div class="bar-fill" id="enemy-fill"></div><span class="bar-text" id="enemy-hp-text"></span></div>
+      <div class="stam-bg"><div class="stam-fill" id="enemy-stam"></div><span class="bar-text" id="enemy-stam-text"></span></div>
+      <div class="parts" id="enemy-parts"></div>
     </div>
   </div>
 

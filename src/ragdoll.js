@@ -30,6 +30,20 @@ const JOINTS = [
   ['upper_leg_r', 'lower_leg_r', [-0.10, 0.54, 0]],
 ];
 
+// Mesh-local Y of each limb segment's top/bottom IK pivot. These are the RIG's
+// joint offsets (rest joint anchor − part centre from PARTS/JOINTS), NOT the
+// geometry extents: a skinned mesh's flesh wraps past its joints (the deltoid
+// rises above the shoulder pivot), so anchoring by bounding box would shift
+// the whole segment down its bone and dislocate the shoulder/hip. The shin's
+// bottom is the one exception — the foot plants by its sole, the lowest
+// geometry point (bot: null → measured from the mesh).
+const SEG_ANCHORS = {
+  upper_arm_l: { top: 0.14, bot: -0.14 }, upper_arm_r: { top: 0.14, bot: -0.14 },
+  lower_arm_l: { top: 0.13, bot: -0.13 }, lower_arm_r: { top: 0.13, bot: -0.13 },
+  upper_leg_l: { top: 0.18, bot: -0.18 }, upper_leg_r: { top: 0.18, bot: -0.18 },
+  lower_leg_l: { top: 0.20, bot: null  }, lower_leg_r: { top: 0.20, bot: null  },
+};
+
 const VITAL = new Set(['pelvis', 'torso', 'head']);
 const MAX_TOTAL_HP = Object.values(PARTS).reduce((s, p) => s + p.hp, 0);
 
@@ -66,6 +80,12 @@ const DODGE_CD    = 0.7;   // s between dodges
 // Parry: a well-timed block deflects the attacker's blade hard and tires them.
 const PARRY_STAM_HIT = 22;  // stamina the attacker loses on a parried blow
 
+// A heavy swing that ends without touching ANYTHING — no flesh, no blade, no
+// shield — leaves the fighter overswung: sword control cuts out and they're
+// wide open for a counter. (Landed/blocked heavies are marked via
+// markSwingLanded by the contact handlers in game.js.)
+const HEAVY_WHIFF_STAGGER = 1.0;
+
 // Controller gains
 const LEVITATE_KP   = 1200;
 const LEVITATE_KD   = 130;
@@ -85,6 +105,30 @@ const SWORD_T_KP    = 24;
 const SWORD_T_KD    = 2;
 const SWORD_T_MAX   = 40;
 
+// Body English — the torso and hips rotate WITH the swing, per HEMA cutting
+// mechanics (power spirals from the rear leg through the hips into the arms;
+// upper and lower body move separately, shoulders leading): the torso coils
+// toward the aim's yaw, the hips follow at half strength, and the torso leans
+// forward into downward cuts. Winding up coils the body back; the strike
+// uncoils it through the cut.
+const COIL_FRAC = 0.35;  // fraction of aimYaw the shoulders coil by
+const COIL_MAX  = 0.85;  // max body twist (rad) — lets the deep windup read
+const COIL_HIPS = 0.5;   // hips coil at this fraction of the shoulders
+const LEAN_FRAC = 0.25;  // forward lean per radian of downward aim
+const LEAN_MAX  = 0.30;  // max forward lean (rad)
+
+// Wrist: the blade's alignment target leads the hand's aim in the direction
+// the aim is travelling — a wrist cock/snap. During a windup the blade cocks
+// further back than the arm points; through a strike it whips further ahead —
+// widening the sword's angular range beyond what the arm alone sweeps. Only
+// the blade-alignment torque uses the deflected direction; the grip position
+// stays on the arm target.
+// (The lead must out-run the blade PD's tracking lag — ~kd·ω/kp ≈ 0.5 rad at
+// a 6 rad/s sweep — or the wrist gets swallowed by it and adds nothing.)
+const WRIST_LEAD = 0.18;  // s of aim rotation the blade leads by
+const WRIST_MAX  = 0.90;  // max wrist deflection per axis (rad)
+const WRIST_EASE = 14;    // how fast the wrist follows the aim rate (1/s)
+
 // Shield controller — holds the left-hand shield up in a guard in front of the
 // chest, face toward the foe. Softer than the sword so it gives a little.
 const SHIELD_KP     = 190;
@@ -94,6 +138,32 @@ const SHIELD_T_KP   = 16;
 const SHIELD_T_KD   = 3;
 const SHIELD_T_MAX  = 28;
 
+// Procedural walk + stance. The leg MESHES are posed kinematically by
+// foot-locked 2-bone IK whenever the fighter is upright: standing still the
+// feet stay planted under the hips (no dangling), and while the body travels
+// each foot is pinned to a fixed ground point through its stance (so it
+// doesn't skate) and arcs to the next foothold during swing. The knee is
+// solved between hip and foot and always bends body-forward like a human's.
+// The result is blended over the physics pose by `standAmt`, which fades out
+// when knocked/downed/dead so the legs hand back to ragdoll. The physics leg
+// bodies stay (for collision/dismemberment) but ride along.
+const WALK_REF_SPEED   = 1.5;   // speed (m/s) at which the gait is fully blended in
+const WALK_MIN_SPEED   = 0.6;   // below this the legs hold a planted idle stance
+const WALK_MIN_AMT     = 0.03;  // below this stride amount the gait is off
+const WALK_BOB         = 0.05;  // vertical body lift per stride — weight of the gait
+const GAIT_CADENCE_BASE = 1.05; // stride cycles/sec at a standstill onset
+const GAIT_CADENCE_SPD  = 0.42; // extra cycles/sec per m/s
+const GAIT_STANCE      = 0.62;  // fraction of the cycle a foot is planted (walking)
+const GAIT_STEP_HEIGHT = 0.14;  // how high the foot lifts mid-swing (m)
+const GAIT_STRIDE_MAX  = 0.42;  // hard cap on how far ahead a foot plants
+const GAIT_KNEE_SLACK  = 0.97;  // stance leg holds this fraction of full reach — slight knee bend
+const HIP_LOCAL        = 0.10;  // hip half-width from pelvis centre (m)
+const HIP_DROP         = 0.16;  // hip height below pelvis centre — lowered for leg reach
+const RUN_SINK         = 0.08;  // hips sink this much at full speed so long strides stay in reach
+const RUN_SINK_REF     = 4.0;   // speed (m/s) at which the full sink is reached
+const IDLE_STEP_LIFT   = 0.05;  // foot lift while gliding back home at idle (m)
+const IDLE_STEP_EASE   = 6;     // how fast an idle foot glides home (1/s)
+
 const KNOCK_THRESHOLD = 40;
 const PELVIS_TARGET_H = 1.0;
 // Ducking: a crouch command (cmd.crouch 0..1) drops the whole body's target
@@ -102,9 +172,14 @@ const PELVIS_TARGET_H = 1.0;
 const DUCK_DROP       = 0.48;  // metres the body sinks at full crouch
 
 // Prone crawl after a leg is lost — dragging yourself is slow and clumsy.
+// CRAWL_FRICTION: standing-grade friction (0.6) on a fully prone body costs
+// ~280 N to slide — far beyond CRAWL_MAX — so whether the crawl moved AT ALL
+// used to depend on the landing pose. A downed fighter's colliders drop to
+// this so he can always drag himself, slowly.
 const CRAWL_SPEED = 1.2;   // m/s
-const CRAWL_KP    = 70;
-const CRAWL_MAX   = 130;
+const CRAWL_KP    = 85;
+const CRAWL_MAX   = 160;
+const CRAWL_FRICTION = 0.25;
 const CRAWL_CHEST_H = 0.55; // torso centre height when propped on the ground
 
 const _v1 = new THREE.Vector3();
@@ -135,7 +210,9 @@ export class Ragdoll {
     this.hp       = {};
     this.detached = new Set();
     this.bodies   = {};
+    this.colliders = {};
     this.meshes   = {};
+    this.restPos  = {};      // part -> rest-pose centre [x,y,z] (for skin alignment)
     this.joints   = {};      // part -> joint connecting it to its parent
     this.knockTimer = 0;
     this.impactAccum = 0;
@@ -146,6 +223,22 @@ export class Ragdoll {
     this.dodgeCd      = 0;      // cooldown before the next dodge
     this.parrying     = false;  // holding a block stance this frame
     this.strikePower  = 1;      // >1 while swinging a heavy blow (set via cmd.power)
+    this._swingLanded = true;   // did the current heavy swing touch anything?
+    this.whiffed      = false;  // set for one frame when a heavy whiffs (HUD text)
+    this.walkAmt      = 0;      // smoothed stride amount (0 still .. 1 full)
+    this.standAmt     = 0;      // leg-IK blend: 1 standing upright .. 0 ragdoll
+    this.walkBob      = 0;      // current vertical lift from the stride (metres)
+    this._ikDt        = 1 / 60; // last control dt, for the idle foot glide
+    this.gaitPhase    = 0;      // stride cycle phase (0..1)
+    this.gait = {               // per-leg foot-lock state for the IK walk
+      l: { plant: new THREE.Vector3(), lift: new THREE.Vector3(), target: new THREE.Vector3(), foot: new THREE.Vector3(), swinging: false, init: false },
+      r: { plant: new THREE.Vector3(), lift: new THREE.Vector3(), target: new THREE.Vector3(), foot: new THREE.Vector3(), swinging: false, init: false },
+    };
+    this._armBend = {           // smoothed elbow bend direction per arm
+      l: new THREE.Vector3(0, -1, 0),
+      r: new THREE.Vector3(0, -1, 0),
+    };
+    this._wrist = { yaw: 0, pitch: 0, prevYawT: null, prevPitch: 0 };
     this._inertia   = {};   // per-part approximate angular inertia
 
     this._hasWeapon = hasWeapon;
@@ -160,6 +253,7 @@ export class Ragdoll {
 
     for (const [name, def] of Object.entries(PARTS)) {
       this.hp[name] = def.hp;
+      this.restPos[name] = def.pos;
 
       const wp = rotY(def.pos, this.facing);
       const isLeg  = name.includes('leg');
@@ -177,6 +271,7 @@ export class Ragdoll {
         collisionGroups: bodyGroups,
       });
       this.bodies[name] = body;
+      this.colliders[name] = collider;
       this.physics.tag(collider, { ref: this, kind: 'part', part: name });
 
       // Mean box inertia — used to clamp angular PD gains per body
@@ -351,14 +446,63 @@ export class Ragdoll {
     return new THREE.Vector3(t.x, t.y, t.z);
   }
 
+  // Contact handlers call this when the fighter's blade meets anything —
+  // flesh, another blade, or a shield — so the swing doesn't count as a whiff.
+  markSwingLanded() { this._swingLanded = true; }
+
   // cmd: { vx, vz, targetYaw, aimYaw, aimPitch, thrust, reach, power }
   updateControl(dt, cmd) {
-    this.strikePower = cmd.power ?? 1;   // read by the contact handler on a hit
+    const power = cmd.power ?? 1;        // read by the contact handler on a hit
+    // Heavy-swing whiff detection on the power transitions: arm when the heavy
+    // starts, and if it ends with the blade having touched nothing, the
+    // fighter overswings — staggered and wide open.
+    if (power > 1 && this.strikePower <= 1) this._swingLanded = false;
+    else if (power <= 1 && this.strikePower > 1 && !this._swingLanded && this.alive) {
+      this.staggerSword(HEAVY_WHIFF_STAGGER);
+      this.whiffed = true;               // game.js flashes the combat text
+    }
+    this.strikePower = power;
     this.impactAccum = Math.max(0, this.impactAccum - 25 * dt);
     if (this.knockTimer > 0)   this.knockTimer   -= dt;
-    if (this.swordStagger > 0) this.swordStagger -= dt;
+    if (this.swordStagger > 0) { this.swordStagger -= dt; this._wrist.prevYawT = null; }
     if (this.dodgeCd > 0)      this.dodgeCd      -= dt;
     this._updateStamina(dt);
+
+    // Stance blend for the leg IK: eases to 1 while standing upright, back to 0
+    // when knocked down, downed, or dead — so the leg meshes hand over to the
+    // ragdoll smoothly instead of popping.
+    this._ikDt = dt;
+    {
+      const pr  = this.bodies.pelvis.rotation();
+      const upY = 1 - 2 * (pr.x * pr.x + pr.z * pr.z);   // pelvis up · world up
+      const standing = this.alive && !this.knocked && !this.downed &&
+                       upY > 0.55 && this.bodies.pelvis.translation().y > 0.45;
+      this.standAmt += ((standing ? 1 : 0) - this.standAmt) *
+                       Math.min(1, dt * (standing ? 6 : 10));
+    }
+
+    // Kill roll spin on the blade. Its roll-axis inertia is ~400x smaller than
+    // transverse, so any contact torque with a component along the blade spins
+    // it up like a drill — and explicit -kd·ω torque on that axis is
+    // numerically unstable (see the SWORD_T_KD comment). Bleeding the roll
+    // VELOCITY directly is unconditionally stable, and runs even while
+    // staggered/knocked — exactly when clash impulses have just landed. NOT
+    // while downed: a crawling fighter's dragged blade legitimately ROLLS
+    // along the ground, and killing that roll turns it into skidding drag
+    // that anchors the crawl.
+    if (this.swordBody && !this.downed) {
+      const sr = this.swordBody.rotation();
+      _q.set(sr.x, sr.y, sr.z, sr.w);
+      const bd = _v1.set(0, 0, 1).applyQuaternion(_q);
+      const av = this.swordBody.angvel();
+      const roll = av.x * bd.x + av.y * bd.y + av.z * bd.z;
+      if (Math.abs(roll) > 0.5) {
+        const dr = roll * (1 - Math.exp(-dt * 20));
+        this.swordBody.setAngvel(
+          { x: av.x - bd.x * dr, y: av.y - bd.y * dr, z: av.z - bd.z * dr }, true);
+      }
+    }
+
     if (!this.alive || this.knocked) return;
 
     const pelvis = this.bodies.pelvis;
@@ -371,15 +515,22 @@ export class Ragdoll {
     if (this.downed) {
       this._crawl(dt, cmd, pelvis, torso, pv);
     } else {
-    // Ducking drops every target height so the whole body crouches down.
+    // Ducking drops every target height so the whole body crouches down. The
+    // walk bob RAISES the body on each push-off (and settles back to standing),
+    // giving weight/gravity to the gait while ensuring the feet never dip below
+    // their planted standing height — i.e. never through the floor.
     const crouch = Math.max(0, Math.min(1, cmd.crouch ?? 0));
-    const drop   = crouch * DUCK_DROP;
+    // At speed the hips sink a touch (RUN_SINK) so the longer strides keep the
+    // feet in reach — real runners drop their hips the same way.
+    const sink   = RUN_SINK * Math.min(1, Math.hypot(pv.x, pv.z) / RUN_SINK_REF);
+    const drop   = crouch * DUCK_DROP - this.walkBob + sink;
 
-    // ── Levitation: spring pelvis toward (ducked) standing height + gravity ff.
-    // Allow a little downward push while crouching so the duck is brisk, not a
-    // slow sag waiting on gravity.
+    // ── Levitation: spring pelvis toward (ducked, bobbing) standing height +
+    // gravity feedforward. The walk bob in `drop` makes the body fall into each
+    // step; vertical damping is eased a touch while walking so the bob shows.
     const weight = 48 * 9.81;
-    let fy = weight + LEVITATE_KP * ((PELVIS_TARGET_H - drop) - pt.y) - LEVITATE_KD * pv.y;
+    const levKD = LEVITATE_KD * (1 - 0.4 * this.walkAmt);
+    let fy = weight + LEVITATE_KP * ((PELVIS_TARGET_H - drop) - pt.y) - levKD * pv.y;
     fy = Math.max(crouch > 0.05 ? -LEVITATE_MAX * 0.4 : 0, Math.min(LEVITATE_MAX, fy));
     pelvis.applyImpulse({ x: 0, y: fy * dt, z: 0 }, true);
 
@@ -404,6 +555,12 @@ export class Ragdoll {
     // Gains are clamped per body to its discrete stability limit — small
     // inertias (head, pelvis) cannot take the full torso gains without the
     // explicit damping overshooting and vibrating the whole ragdoll.
+    // The torso's up-target leans forward into downward cuts (body English);
+    // pelvis and head stay on world up.
+    const lean = Math.max(0, Math.min(LEAN_MAX, (0.2 - (cmd.aimPitch ?? 0.25)) * LEAN_FRAC));
+    const leanUp = new THREE.Vector3(
+      Math.sin(cmd.targetYaw) * Math.sin(lean), Math.cos(lean),
+      Math.cos(cmd.targetYaw) * Math.sin(lean));
     const uprightBodies = [['torso', 1.0], ['pelvis', 1.0]];
     if (!this.detached.has('head')) uprightBodies.push(['head', 0.3]);
     for (const [name, scale] of uprightBodies) {
@@ -414,7 +571,7 @@ export class Ragdoll {
       const r = b.rotation();
       _q.set(r.x, r.y, r.z, r.w);
       _v1.set(0, 1, 0).applyQuaternion(_q);            // current up
-      _v2.crossVectors(_v1, new THREE.Vector3(0, 1, 0)); // axis toward world up
+      _v2.crossVectors(_v1, name === 'torso' ? leanUp : new THREE.Vector3(0, 1, 0));
       const w = b.angvel();
       const tq = clampVec({
         x: kp * _v2.x - kd * w.x,
@@ -424,12 +581,17 @@ export class Ragdoll {
       b.applyTorqueImpulse({ x: tq.x * dt, y: tq.y * dt, z: tq.z * dt }, true);
     }
 
-    // ── Yaw control toward targetYaw.
+    // ── Yaw control toward targetYaw, plus the swing coil.
     // Each body uses its own heading error — steering the pelvis by the
     // torso's error leaves it with no anchor and it spins continuously.
+    // The coil twists the shoulders toward the aim (windup coils back, the
+    // strike uncoils through the cut); the hips follow at half strength, so
+    // upper and lower body move separately like a real cutter's.
     {
-      const dx = Math.sin(cmd.targetYaw), dz = Math.cos(cmd.targetYaw);
-      for (const b of [torso, pelvis]) {
+      const coil = Math.max(-COIL_MAX, Math.min(COIL_MAX, (cmd.aimYaw ?? 0) * COIL_FRAC));
+      for (const [b, share] of [[torso, 1], [pelvis, COIL_HIPS]]) {
+        const yawTgt = cmd.targetYaw + coil * share;
+        const dx = Math.sin(yawTgt), dz = Math.cos(yawTgt);
         const r = b.rotation();
         _q.set(r.x, r.y, r.z, r.w);
         _v1.set(0, 0, 1).applyQuaternion(_q);
@@ -461,6 +623,9 @@ export class Ragdoll {
       }
     }
 
+    // ── Procedural walk — swing the legs while moving.
+    this._updateLegs(dt, pv);
+
     }
 
     // ── Sword PD control — the Half Sword part.
@@ -475,6 +640,27 @@ export class Ragdoll {
       const yawT  = cmd.targetYaw + cmd.aimYaw;
       const cp = Math.cos(aimPitch), sp = Math.sin(aimPitch);
       const dir = _v1.set(Math.sin(yawT) * cp, sp, Math.cos(yawT) * cp);
+
+      // Wrist cock/snap: the blade's alignment target is deflected ahead of
+      // the aim by how fast the aim is rotating (clamped and smoothed). The
+      // hand keeps pointing where the arm aims; the WRIST angles the blade
+      // beyond it — cocking extra during the windup, whipping further through
+      // the strike. (prevYawT is reset while staggered so control resumes
+      // without a spurious rate spike.)
+      const w = this._wrist;
+      if (w.prevYawT === null) { w.prevYawT = yawT; w.prevPitch = aimPitch; }
+      let dyaw = yawT - w.prevYawT;
+      dyaw = Math.atan2(Math.sin(dyaw), Math.cos(dyaw));   // wrap to ±π
+      const dpitch = aimPitch - w.prevPitch;
+      w.prevYawT = yawT; w.prevPitch = aimPitch;
+      const clampW = v => Math.max(-WRIST_MAX, Math.min(WRIST_MAX, v));
+      const kw = Math.min(1, dt * WRIST_EASE);
+      w.yaw   += (clampW((dyaw   / dt) * WRIST_LEAD) - w.yaw)   * kw;
+      w.pitch += (clampW((dpitch / dt) * WRIST_LEAD) - w.pitch) * kw;
+      const bYaw = yawT + w.yaw, bPitch = aimPitch + w.pitch;
+      const bcp = Math.cos(bPitch);
+      const bladeAim = new THREE.Vector3(
+        Math.sin(bYaw) * bcp, Math.sin(bPitch), Math.cos(bYaw) * bcp);
 
       // Shoulder world position (right shoulder local in torso frame)
       const tr  = torso.rotation();
@@ -507,17 +693,17 @@ export class Ragdoll {
       // overwhelms the blade-alignment torque below.
       this.swordBody.applyImpulse({ x: F.x * dt, y: F.y * dt, z: F.z * dt }, true);
 
-      // Torque to point the blade along the aim direction.
+      // Torque to point the blade along the wrist-deflected aim direction.
       // Damp only the transverse spin and never inject roll torque: the
       // roll-axis inertia is ~400x smaller, so -kd*w on it is numerically
       // unstable and spins the blade up like a gyroscope.
       const bladeDir = new THREE.Vector3(0, 0, 1).applyQuaternion(_q);
       const sw = this.swordBody.angvel();
-      const w  = new THREE.Vector3(sw.x, sw.y, sw.z);
-      w.addScaledVector(bladeDir, -w.dot(bladeDir));   // transverse component
+      const wv = new THREE.Vector3(sw.x, sw.y, sw.z);
+      wv.addScaledVector(bladeDir, -wv.dot(bladeDir));  // transverse component
       const T = new THREE.Vector3()
-        .crossVectors(bladeDir, dir).multiplyScalar(SWORD_T_KP * auth)
-        .addScaledVector(w, -SWORD_T_KD);
+        .crossVectors(bladeDir, bladeAim).multiplyScalar(SWORD_T_KP * auth)
+        .addScaledVector(wv, -SWORD_T_KD);
       T.addScaledVector(bladeDir, -T.dot(bladeDir));   // strip roll torque
       clampVec(T, SWORD_T_MAX * auth);
       this.swordBody.applyTorqueImpulse({ x: T.x * dt, y: T.y * dt, z: T.z * dt }, true);
@@ -577,6 +763,289 @@ export class Ragdoll {
         z: cz * SHIELD_T_KP - SHIELD_T_KD * sw.z,
       }, SHIELD_T_MAX);
       this.shieldBody.applyTorqueImpulse({ x: T.x * dt, y: T.y * dt, z: T.z * dt }, true);
+    }
+  }
+
+  // Track how much we're walking (0 still .. 1 full stride) and the body's
+  // weight bob. The actual leg posing is kinematic (see _poseLegsIK in
+  // syncMeshes). Advancing the gait phase here keeps it in lockstep with physics.
+  _updateLegs(dt, pv) {
+    const speed  = Math.hypot(pv.x, pv.z);
+    const target = speed > WALK_MIN_SPEED ? Math.min(1, speed / WALK_REF_SPEED) : 0;
+    this.walkAmt += (target - this.walkAmt) * Math.min(1, dt * 8);
+    if (this.walkAmt < WALK_MIN_AMT) { this.walkBob = 0; this.gaitPhase = 0; return; }
+
+    const cadence = GAIT_CADENCE_BASE + speed * GAIT_CADENCE_SPD;
+    this.gaitPhase = (this.gaitPhase + dt * cadence) % 1;
+    // Body lifts on each push-off (twice per stride), settling back to stance —
+    // weight without ever pushing the planted feet below ground.
+    this.walkBob = WALK_BOB * this.walkAmt * (0.5 - 0.5 * Math.cos(4 * Math.PI * this.gaitPhase));
+  }
+
+  // Kinematically pose the leg meshes with foot-locked 2-bone IK, blended over
+  // the physics pose by standAmt. Standing still the feet hold planted under
+  // the hips (stepping back home if the body drifted); while moving they walk
+  // the plant/swing gait. Called from syncMeshes (after the physics pose is
+  // written). Skipped when a leg is gone or the blend has faded out.
+  _poseLegsIK() {
+    if (this.standAmt < 0.02) return;
+    for (const p of ['upper_leg_l', 'lower_leg_l', 'upper_leg_r', 'lower_leg_r'])
+      if (this.detached.has(p)) return;
+
+    const pelvis = this.bodies.pelvis;
+    const pt = pelvis.translation();
+    const pr = pelvis.rotation();
+    const pq = _q.set(pr.x, pr.y, pr.z, pr.w);
+    const pv = pelvis.linvel();
+    const speed = Math.hypot(pv.x, pv.z);
+
+    // Body-forward (horizontal) — the knees always bend this way.
+    const f = _v1.set(0, 0, 1).applyQuaternion(pq);
+    const fl = Math.hypot(f.x, f.z) || 1;
+    const fx = f.x / fl, fz = f.z / fl;
+
+    // Travel direction (horizontal) — the feet step this way; falls back to
+    // body-forward when nearly still.
+    let dx = pv.x, dz = pv.z;
+    const L = Math.hypot(dx, dz);
+    if (L > 0.1) { dx /= L; dz /= L; } else { dx = fx; dz = fz; }
+
+    // Feet plant at whatever height lets the actual leg meshes (box or GLB —
+    // lengths differ) reach the ground with a slight knee bend, never locked out.
+    const reach = this._segLen('upper_leg_l') + this._segLen('lower_leg_l');
+    const footY = Math.max(0, PELVIS_TARGET_H - HIP_DROP - reach * GAIT_KNEE_SLACK);
+
+    // Stride length: the kinematic demand (speed × stance time) capped by what
+    // the legs can geometrically reach at the current hip height. When reach is
+    // the limit, the stance fraction shrinks to match — the gait shifts from a
+    // walk toward a run instead of hyper-extending and skating.
+    const cadence = GAIT_CADENCE_BASE + speed * GAIT_CADENCE_SPD;
+    const sink    = RUN_SINK * Math.min(1, speed / RUN_SINK_REF);
+    const vert    = Math.max(0.1, PELVIS_TARGET_H - HIP_DROP - sink - footY);
+    const budget  = Math.sqrt(Math.max(0.01, (reach * 0.995) ** 2 - vert * vert));
+    const hsKin   = speed * GAIT_STANCE / (2 * cadence);
+    const halfStride = Math.min(hsKin, budget, GAIT_STRIDE_MAX);
+    const stance  = hsKin > 1e-4 ? GAIT_STANCE * (halfStride / hsKin) : GAIT_STANCE;
+
+    const walking = this.walkAmt >= WALK_MIN_AMT;
+    this._poseLeg(this.gait.l, 'upper_leg_l', 'lower_leg_l',  HIP_LOCAL, 0.0, pt, pq, dx, dz, halfStride, stance, walking, fx, fz, footY);
+    this._poseLeg(this.gait.r, 'upper_leg_r', 'lower_leg_r', -HIP_LOCAL, 0.5, pt, pq, dx, dz, halfStride, stance, walking, fx, fz, footY);
+  }
+
+  _poseLeg(leg, thighName, shinName, hipX, phaseOff, pt, pq, dx, dz, halfStride, stance, walking, fx, fz, footY) {
+    // Hip joint world position = pelvis centre + body-local hip offset.
+    const hipL = _v1.set(hipX, -HIP_DROP, 0).applyQuaternion(pq);
+    const hip = new THREE.Vector3(pt.x + hipL.x, pt.y + hipL.y, pt.z + hipL.z);
+
+    if (!leg.init) {
+      leg.plant.set(hip.x, footY, hip.z);
+      leg.target.copy(leg.plant);
+      leg.foot.copy(leg.plant);
+      leg.init = true;
+    }
+
+    const foot = leg.foot;
+    if (walking) {
+      const lp = (this.gaitPhase + phaseOff) % 1;
+      if (lp < stance) {                          // STANCE — foot pinned to ground
+        if (leg.swinging) { leg.swinging = false; leg.plant.copy(leg.target); }
+        foot.copy(leg.plant);
+      } else {                                     // SWING — arc to the next foothold
+        if (!leg.swinging) { leg.swinging = true; leg.lift.copy(leg.plant); }
+        const t = (lp - stance) / (1 - stance);
+        leg.target.set(hip.x + dx * halfStride, footY, hip.z + dz * halfStride);
+        const s = t * t * (3 - 2 * t);            // smoothstep
+        foot.set(
+          leg.lift.x + (leg.target.x - leg.lift.x) * s,
+          footY + Math.sin(Math.PI * t) * GAIT_STEP_HEIGHT,
+          leg.lift.z + (leg.target.z - leg.lift.z) * s,
+        );
+      }
+    } else {
+      // IDLE — the foot stays planted under its hip. If the body drifted away
+      // (dodge, shove, end of a walk) glide it back home with a small lift.
+      leg.swinging = false;
+      const off = Math.hypot(foot.x - hip.x, foot.z - hip.z);
+      if (off > 0.015) {
+        const k = Math.min(1, this._ikDt * IDLE_STEP_EASE);
+        foot.x += (hip.x - foot.x) * k;
+        foot.z += (hip.z - foot.z) * k;
+        foot.y = footY + Math.min(IDLE_STEP_LIFT, off * 0.5);
+      } else {
+        foot.y = footY;
+      }
+      leg.plant.set(foot.x, footY, foot.z);
+      leg.target.copy(leg.plant);
+    }
+
+    // 2-bone IK: solve the knee between hip and foot.
+    const lT = this._segLen(thighName);
+    const lS = this._segLen(shinName);
+    const F = new THREE.Vector3(foot.x, foot.y, foot.z);
+    const axis = new THREE.Vector3().subVectors(F, hip);
+    let d = axis.length();
+    if (d < 1e-4) { axis.set(0, -1, 0); d = 1e-4; } else axis.divideScalar(d);
+    d = Math.max(Math.abs(lT - lS) + 0.02, Math.min((lT + lS) * 0.999, d));
+    F.copy(hip).addScaledVector(axis, d);
+    const a = (lT * lT - lS * lS + d * d) / (2 * d);
+    const hh = Math.sqrt(Math.max(0, lT * lT - a * a));
+    const kneeBase = new THREE.Vector3().copy(hip).addScaledVector(axis, a);
+    // Knee bends body-forward like a human's — never toward travel, which
+    // would fold it backward on a backpedal.
+    const bend = new THREE.Vector3(fx, 0, fz);
+    bend.addScaledVector(axis, -bend.dot(axis));
+    if (bend.lengthSq() < 1e-6) bend.set(dx, 0, dz);
+    bend.normalize();
+    const knee = new THREE.Vector3().copy(kneeBase).addScaledVector(bend, hh);
+
+    // Kneecap and toes both face the way the knee bends (≈ body-forward).
+    this._poseSegment(thighName, hip, knee, bend);
+    this._poseSegment(shinName, knee, F, bend);
+  }
+
+  // Kinematically pose the arm meshes with 2-bone IK: shoulder → elbow → the
+  // point where the physics actually holds the prop (sword grip / shield
+  // strap), so the hand meshes stay wrapped on their weapons and the elbows
+  // bend down-and-outward like a human's — never up through the shoulder or
+  // twisted about the arm's own axis. Purely visual, blended by standAmt; the
+  // physics arm chain still drives the weapons.
+  _poseArmsIK() {
+    if (this.standAmt < 0.02) return;
+    const torso = this.bodies.torso;
+    const tr = torso.rotation();
+    const tt = torso.translation();
+    const tq = _q.set(tr.x, tr.y, tr.z, tr.w);
+    // Body-forward (horizontal) — hanging elbows drift behind the back.
+    const f  = _v1.set(0, 0, 1).applyQuaternion(tq);
+    const fl = Math.hypot(f.x, f.z) || 1;
+    const fx = f.x / fl, fz = f.z / fl;
+
+    // Right arm → sword grip (sword local (0,0,-0.40)).
+    if (this.swordBody && this.swordArmIntact) {
+      const sr = this.swordBody.rotation();
+      const st = this.swordBody.translation();
+      const grip = new THREE.Vector3(0, 0, -0.40)
+        .applyQuaternion(new THREE.Quaternion(sr.x, sr.y, sr.z, sr.w))
+        .add(new THREE.Vector3(st.x, st.y, st.z));
+      this._poseArm('r', 'upper_arm_r', 'lower_arm_r', -0.30, grip, tq, tt, fx, fz);
+    }
+
+    // Left arm → shield strap (shield local (0,0,-TH)). Skipped once the
+    // shield is dropped — the arm hands back to ragdoll.
+    if (this.shieldBody && this.shieldJoint &&
+        !this.detached.has('upper_arm_l') && !this.detached.has('lower_arm_l')) {
+      const sr = this.shieldBody.rotation();
+      const st = this.shieldBody.translation();
+      const strap = new THREE.Vector3(0, 0, -0.045)
+        .applyQuaternion(new THREE.Quaternion(sr.x, sr.y, sr.z, sr.w))
+        .add(new THREE.Vector3(st.x, st.y, st.z));
+      this._poseArm('l', 'upper_arm_l', 'lower_arm_l', 0.30, strap, tq, tt, fx, fz);
+    }
+  }
+
+  _poseArm(key, upperName, lowerName, shoulderX, wrist, tq, tt, fx, fz) {
+    if (this.detached.has(upperName) || this.detached.has(lowerName)) return;
+    const shoulder = new THREE.Vector3(shoulderX, 0.14, 0)
+      .applyQuaternion(tq).add(new THREE.Vector3(tt.x, tt.y, tt.z));
+
+    // A touch of shrug: the shoulder pivot rides up as the arm rises — a
+    // pivot bolted rigidly to the ribcage reads robotic overhead.
+    {
+      const dy = wrist.y - shoulder.y;
+      const dl = wrist.distanceTo(shoulder) || 1;
+      shoulder.y += 0.04 * Math.max(0, dy / dl);
+    }
+
+    // 2-bone IK: solve the elbow between shoulder and wrist.
+    const lU = this._segLen(upperName);
+    const lL = this._segLen(lowerName);
+    const W = wrist.clone();
+    const axis = new THREE.Vector3().subVectors(W, shoulder);
+    let d = axis.length();
+    if (d < 1e-4) { axis.set(0, -1, 0); d = 1e-4; } else axis.divideScalar(d);
+    d = Math.max(Math.abs(lU - lL) + 0.02, Math.min((lU + lL) * 0.999, d));
+    W.copy(shoulder).addScaledVector(axis, d);
+    const a = (lU * lU - lL * lL + d * d) / (2 * d);
+    const hh = Math.sqrt(Math.max(0, lU * lU - a * a));
+
+    // Elbow hint varies with arm elevation, like a real shoulder:
+    //   hanging (e≈−1)  → elbow drifts back behind the ribs;
+    //   reaching (e≈0)  → elbow folds down-and-out under the forearm;
+    //   overhead (e≈+1) → elbow swings wide out to the side.
+    const out = new THREE.Vector3(shoulder.x - tt.x, 0, shoulder.z - tt.z);
+    if (out.lengthSq() < 1e-6) out.set(shoulderX, 0, 0);
+    out.normalize();
+    const e = axis.y;                       // −1 hanging … +1 overhead
+    const hint = new THREE.Vector3()
+      .addScaledVector(out, 0.55 + 0.75 * Math.max(0, e))
+      .addScaledVector(_v2.set(0, -1, 0), 0.9 * (1 - 0.6 * Math.abs(e)))
+      .addScaledVector(_v2.set(fx, 0, fz), -0.1 - 0.55 * Math.max(0, -e));
+    hint.addScaledVector(axis, -hint.dot(axis));
+    if (hint.lengthSq() < 1e-6) hint.copy(out).addScaledVector(axis, -out.dot(axis));
+    hint.normalize();
+
+    // Smooth the bend direction over time — a whipping sword sweeps the arm
+    // axis across the hint, and without smoothing the elbow flips sides
+    // between frames instead of swinging round like a joint.
+    const bend = this._armBend[key];
+    bend.lerp(hint, Math.min(1, this._ikDt * 12));
+    bend.addScaledVector(axis, -bend.dot(axis));
+    if (bend.lengthSq() < 1e-6) bend.copy(hint);
+    bend.normalize();
+    const elbow = new THREE.Vector3().copy(shoulder)
+      .addScaledVector(axis, a).addScaledVector(bend, hh);
+
+    // Biceps and inner forearm face away from the elbow point — the roll that
+    // keeps the hand geometry sitting on the grip the right way round.
+    const roll = bend.clone().negate();
+    this._poseSegment(upperName, shoulder, elbow, roll);
+    this._poseSegment(lowerName, elbow, W, roll);
+  }
+
+  // Place a limb-segment mesh so its top pivot (local segTop) sits at `top`
+  // and its bottom pivot (local segBot) at `bottom`, blended over the current
+  // physics pose. `zHint` fixes the roll about the bone: the mesh's local +Z
+  // (kneecap, toes, biceps — the parts are all authored facing +Z) is rolled
+  // toward it, so a segment never spins freely about its own long axis.
+  _poseSegment(name, top, bottom, zHint) {
+    const mesh = this.meshes[name];
+    if (mesh.userData.segTop === undefined) this._cacheSeg(name, mesh);
+    const dir = new THREE.Vector3().subVectors(bottom, top);
+    if (dir.lengthSq() < 1e-8) return;
+    dir.normalize();
+    // Basis: local -Y runs down the segment, local +Z toward the hint.
+    const yAxis = new THREE.Vector3().copy(dir).negate();
+    const zAxis = new THREE.Vector3().copy(zHint).addScaledVector(dir, -zHint.dot(dir));
+    if (zAxis.lengthSq() < 1e-6)       // hint parallel to the bone — face "up"
+      zAxis.set(0, 1, 0).addScaledVector(dir, -dir.y);
+    if (zAxis.lengthSq() < 1e-6) zAxis.set(0, 0, 1);
+    zAxis.normalize();
+    const xAxis = new THREE.Vector3().crossVectors(yAxis, zAxis);
+    const q = new THREE.Quaternion().setFromRotationMatrix(
+      new THREE.Matrix4().makeBasis(xAxis, yAxis, zAxis));
+    const topLocal = new THREE.Vector3(0, mesh.userData.segTop, 0).applyQuaternion(q);
+    const pos = new THREE.Vector3().subVectors(top, topLocal);
+    const b = Math.min(1, this.standAmt);
+    mesh.position.lerp(pos, b);
+    mesh.quaternion.slerp(q, b);
+  }
+
+  _segLen(name) {
+    const mesh = this.meshes[name];
+    if (mesh.userData.segTop === undefined) this._cacheSeg(name, mesh);
+    return mesh.userData.segTop - mesh.userData.segBot;
+  }
+
+  _cacheSeg(name, mesh) {
+    const a = SEG_ANCHORS[name];
+    mesh.userData.segTop = a.top;
+    if (a.bot !== null) { mesh.userData.segBot = a.bot; return; }
+    const geo = mesh.geometry;                // shin: bottom pivot = the sole
+    if (geo) {
+      if (!geo.boundingBox) geo.computeBoundingBox();
+      mesh.userData.segBot = geo.boundingBox.min.y;
+    } else {
+      mesh.userData.segBot = -0.20;           // group/empty — box shin sole
     }
   }
 
@@ -667,8 +1136,13 @@ export class Ragdoll {
   _sever(part) {
     if (this.detached.has(part)) return;
     this.detached.add(part);
-    // Lose a leg → go prone; drop the shield so it doesn't anchor the crawl.
-    if (part.includes('leg')) { this.downed = true; this._dropShield(); }
+    // Lose a leg → go prone; drop the shield so it doesn't anchor the crawl,
+    // and slicken the body so the weak crawl forces can actually drag it.
+    if (part.includes('leg')) {
+      this.downed = true;
+      this._dropShield();
+      for (const c of Object.values(this.colliders)) c.setFriction(CRAWL_FRICTION);
+    }
     const joint = this.joints[part];
     if (joint) {
       this.physics.removeJoint(joint);
@@ -691,19 +1165,28 @@ export class Ragdoll {
 
   _flash(part) {
     const mesh = this.meshes[part];
-    if (!mesh) return;
-    const m = mesh.material;
-    const orig = m.color.getHex();
-    m.color.setHex(0xff3333);
-    setTimeout(() => m.color.setHex(orig), 110);
+    if (!mesh || !mesh.material) return;
+    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    const origs = mats.map(m => m.color.getHex());
+    mats.forEach(m => m.color.setHex(0xff3333));
+    setTimeout(() => mats.forEach((m, i) => m.color.setHex(origs[i])), 110);
   }
 
   syncMeshes() {
     for (const [name, body] of Object.entries(this.bodies)) {
       const t = body.translation();
       const r = body.rotation();
-      this.meshes[name].position.set(t.x, t.y, t.z);
-      this.meshes[name].quaternion.set(r.x, r.y, r.z, r.w);
+      const mesh = this.meshes[name];
+      mesh.position.set(t.x, t.y, t.z);
+      mesh.quaternion.set(r.x, r.y, r.z, r.w);
+      // Hard floor: a foot mesh may never render below the ground. Lift it so
+      // its lowest point rests on y=0 if physics would push it under.
+      const fp = mesh.userData.footPt;
+      if (fp) {
+        _v1.copy(fp).applyQuaternion(mesh.quaternion);
+        const footY = mesh.position.y + _v1.y;
+        if (footY < 0) mesh.position.y -= footY;
+      }
     }
     if (this.swordBody) {
       const t = this.swordBody.translation();
@@ -717,6 +1200,17 @@ export class Ragdoll {
       this.shieldMesh.position.set(t.x, t.y, t.z);
       this.shieldMesh.quaternion.set(r.x, r.y, r.z, r.w);
     }
+    // Legs: foot-locked IK stance/walk, blended by standAmt (fades back to
+    // ragdoll when knocked down or dead). Off for good once a leg is severed.
+    // Arms: IK from shoulder to the physics grip/strap points, same blend.
+    if (!this.downed) this._poseLegsIK();
+    this._poseArmsIK();
+  }
+
+  // Show/hide the per-part collider meshes (hidden when a skinned avatar is
+  // draped over the ragdoll). The blades stay; the skin doesn't carry them.
+  setMeshesVisible(v) {
+    for (const m of Object.values(this.meshes)) m.visible = v;
   }
 
   // Mid-blade world velocity — used for impact damage

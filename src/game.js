@@ -6,6 +6,7 @@ import { EnemyAI }           from './ai.js';
 import { ThirdPersonCamera } from './camera.js';
 import { buildArena }        from './arena.js';
 import { audio }             from './audio.js';
+import { GlbAvatar }         from './skin.js';
 
 const ENEMY_IDLE     = true;  // sparring mode: enemy holds ground and randomly
                               // swings. Set false for the aggressive chasing AI.
@@ -19,13 +20,22 @@ const SWING_REACH    = 0.62;
 const THRUST_REACH   = 0.85;
 const SWING_TIME     = 0.34;  // seconds for the strike sweep
 // Heavy swing: hold the windup (LMB) past HEAVY_CHARGE_TIME to load a big,
-// committed blow — a much longer arc, longer reach, extra stamina, and more
-// damage. A blocked heavy hit also knocks the blocking blade/shield back harder.
-const HEAVY_CHARGE_TIME = 0.40;  // hold the windup this long to charge it
-const HEAVY_SWING_TIME  = 0.46;  // the longer arc takes a touch longer to sweep
-const HEAVY_SWING_REACH = 0.98;  // arm extends much further on the heavy strike
-const HEAVY_POWER       = 2.2;   // damage / knockback multiplier when it lands
-const HEAVY_STAM_COST   = 32;    // stamina spent committing to the heavy swing
+// committed blow — a huge arc, longer reach, and far more damage. It's a
+// high-risk move: the charge is a slow, readable telegraph; it dumps a big
+// chunk of stamina; a whiffed heavy (touches nothing) leaves you overswung
+// and staggered; and a parried/blocked one staggers you in proportion to the
+// power you swung with. A blocked heavy also drives the blocking blade/shield
+// — and the body behind it — back correspondingly harder.
+// Windup arc: the aim rides a time-parametrized curve into the chamber —
+// smoothstep easing with the pitch lifted mid-path — so the tip circles
+// up-and-over backward (a moulinet) instead of snapping along a chord.
+const WINDUP_ARC_TIME   = 0.35;  // s for the backswing arc to complete
+const WINDUP_ARC_LIFT   = 0.5;   // extra pitch at the arc's midpoint (rad)
+const HEAVY_CHARGE_TIME = 0.75;  // hold the windup this long — the telegraph
+const HEAVY_SWING_TIME  = 0.58;  // the huge arc takes longer to sweep
+const HEAVY_SWING_REACH = 1.02;  // arm extends much further on the heavy strike
+const HEAVY_POWER       = 3.2;   // damage / knockback multiplier when it lands
+const HEAVY_STAM_COST   = 45;    // big stamina dump committed to the swing
 const MIN_HIT_SPEED  = 1.6;   // m/s — slower contacts do no damage
 const PARRY_YAW      = 0.00;  // block guard: blade raised centred in front
 const PARRY_PITCH    = 0.70;
@@ -38,6 +48,23 @@ const PARRY_LOW_PITCH  = -0.65; // a low block, blade swept down across the legs
 const PARRY_HIGH_PITCH =  1.20; // a high block raised overhead
 const PARRY_SIDE_REACH = 0.74;  // arm extends further on a side/low block
 
+// Random deflection spin for a clash — but never about the blade's own long
+// axis (its roll inertia is tiny, so roll torque spins it up like a drill),
+// and capped so a heavy's scaled impulse twists the blade rather than
+// windmilling it end over end.
+function deflectSpin(body, mag) {
+  mag = Math.min(mag, 0.8);
+  const r = body.rotation();
+  const bd = new THREE.Vector3(0, 0, 1)
+    .applyQuaternion(new THREE.Quaternion(r.x, r.y, r.z, r.w));
+  const t = new THREE.Vector3(
+    (Math.random() - 0.5) * mag,
+    (Math.random() - 0.5) * mag,
+    (Math.random() - 0.5) * mag);
+  t.addScaledVector(bd, -t.dot(bd));   // strip the roll component
+  body.applyTorqueImpulse({ x: t.x, y: t.y, z: t.z }, true);
+}
+
 export class Game {
   constructor(RAPIER, input, onGameOver, { auto = false } = {}) {
     this.input       = input;
@@ -49,7 +76,8 @@ export class Game {
     this.aimPitch = GUARD_PITCH;
     // Attack state machine: guard -> windup (LMB held) -> swing (LMB released)
     this.attack   = { state: 'guard', timer: 0, strike: null, reach: GUARD_REACH, thrust: false,
-                      charge: 0, heavy: false, power: 1 };
+                      charge: 0, heavy: false, power: 1,
+                      from: { yaw: GUARD_YAW, pitch: GUARD_PITCH } };
     this._hitCd   = { player: 0, enemy: 0 };
     this._clangCd = 0;
     this.crouch   = 0;   // 0..1 duck amount, smoothed from the crouch key
@@ -121,6 +149,14 @@ export class Game {
       player: this._buildPartBars('player-parts', this.player),
       enemy:  this._buildPartBars('enemy-parts',  this.enemy),
     };
+
+    // Drape the rigged gladiator GLB over each fighter (tinted per side). Each
+    // falls back to its box meshes if the model fails to load.
+    this.skins = [
+      new GlbAvatar(this.scene, this.player, { tint: 0xb08040 }),
+      new GlbAvatar(this.scene, this.enemy,  { tint: 0x6b1e1e }),
+    ];
+
     this.lastTime = performance.now();
     this.renderer.setAnimationLoop(() => this._loop());
   }
@@ -148,6 +184,7 @@ export class Game {
 
   destroy() {
     this.renderer.setAnimationLoop(null);
+    if (this.skins) for (const s of this.skins) s.dispose();
     window.removeEventListener('resize', this._onResize);
     this.renderer.domElement.remove();
     this.renderer.dispose();
@@ -249,6 +286,7 @@ export class Game {
 
     this.player.syncMeshes();
     this.enemy.syncMeshes();
+    if (this.skins) for (const s of this.skins) s.update();
 
     this._updateHUD();
     this._checkWinLose();
@@ -273,17 +311,28 @@ export class Game {
       atk.reach  = GUARD_REACH;
       atk.thrust = false;
       atk.power  = 1;
-      if (lmb && this.player.alive) { atk.state = 'windup'; atk.charge = 0; atk.heavy = false; }
+      if (lmb && this.player.alive) {
+        atk.state = 'windup'; atk.charge = 0; atk.heavy = false;
+        atk.from  = { yaw: this.aimYaw, pitch: this.aimPitch };   // arc start
+      }
 
     } else if (atk.state === 'windup') {
       // Holding the windup charges a heavy swing (needs the stamina to spend).
       atk.charge += dt;
       atk.heavy = atk.charge >= HEAVY_CHARGE_TIME && this.player.stamina > HEAVY_STAM_COST;
-      // Re-read keys every frame so the path can be adjusted mid-windup
+      // Re-read keys every frame so the path can be adjusted mid-windup.
+      // The aim rides the windup arc: smoothstep from the guard pose it left
+      // toward the chamber, pitch lifted mid-path so the tip circles
+      // over-and-back rather than yanking sideways.
       const pose = this._swingPoses(basePitch, atk.heavy).windup;
-      const k = Math.min(1, dt * 10);
-      this.aimYaw   += (pose.yaw   - this.aimYaw)   * k;
-      this.aimPitch += (pose.pitch - this.aimPitch) * k;
+      const s = Math.min(1, atk.charge / WINDUP_ARC_TIME);
+      const e = s * s * (3 - 2 * s);
+      const lift = WINDUP_ARC_LIFT * Math.sin(Math.PI * e);
+      const ty = atk.from.yaw   + (pose.yaw   - atk.from.yaw)   * e;
+      const tp = Math.min(2.0, atk.from.pitch + (pose.pitch - atk.from.pitch) * e + lift);
+      const k = Math.min(1, dt * 14);
+      this.aimYaw   += (ty - this.aimYaw)   * k;
+      this.aimPitch += (tp - this.aimPitch) * k;
       atk.reach += ((pose.reach ?? WINDUP_REACH) - atk.reach) * k;
       if (!lmb) {
         const poses = this._swingPoses(basePitch, atk.heavy);
@@ -355,8 +404,8 @@ export class Game {
         // down with extended reach — the reliable way to hit a foe on the
         // ground, or to chop at a standing opponent's legs.
         p = {
-          windup: { yaw:  1.4 * d, pitch: basePitch - 0.20, reach: 0.50 },
-          strike: { yaw: -1.2 * d, pitch: basePitch - 0.85, reach: THRUST_REACH },
+          windup: { yaw:  2.0 * d, pitch: basePitch - 0.20, reach: 0.50 },
+          strike: { yaw: -1.4 * d, pitch: basePitch - 0.85, reach: THRUST_REACH },
         };
       } else {
         p = {
@@ -378,17 +427,33 @@ export class Game {
         strike: { yaw: 0.00, pitch: basePitch - 0.85, reach: THRUST_REACH, thrust: true },
       };
     } else {
+      // Chamber well past the shoulder line so the blade swivels back behind
+      // the body, then cut through past centre — not a poke.
       p = {
-        windup: { yaw:  1.5 * d, pitch: basePitch + 0.55 },
-        strike: { yaw: -1.3 * d, pitch: basePitch - 0.10 },
+        windup: { yaw:  2.2 * d, pitch: basePitch + 0.55 },
+        strike: { yaw: -1.55 * d, pitch: basePitch - 0.10 },
       };
     }
 
-    // A heavy swing cocks back further and sweeps through a much longer arc with
-    // extended reach, so the blade travels farther and faster into the target.
+    // A heavy cocks into a golf-style backswing — hands pulled in tight while
+    // the TIP sweeps back behind the shoulder and up (the visible telegraph) —
+    // then whips down through a huge arc with extended reach.
     if (heavy) {
-      p.windup = { ...p.windup, yaw: p.windup.yaw * 1.55 };
-      p.strike = { ...p.strike, yaw: p.strike.yaw * 1.7, reach: HEAVY_SWING_REACH };
+      const rel = p.windup.pitch - basePitch;   // how vertical this swing's windup is
+      p.windup = rel >= 1.1
+        // vertical swings (overhead / pendulum): cock clear over the back
+        ? { ...p.windup, yaw: p.windup.yaw * 1.7, pitch: basePitch + 1.95, reach: 0.30 }
+        // side/low cuts: tip back behind the windup-side shoulder and raised
+        // (pitch capped short of vertical so the lean-back stays readable)
+        : { ...p.windup,
+            yaw:   THREE.MathUtils.clamp(p.windup.yaw * 1.7, -2.6, 2.6),
+            pitch: Math.min(p.windup.pitch + 0.85, 1.25),
+            reach: 0.30 };
+      // Yaw clamped short of π — past it the scalar aim lerp sweeps the long
+      // way round (a full-circle windmill).
+      p.strike = { ...p.strike,
+                   yaw:   THREE.MathUtils.clamp(p.strike.yaw * 2.3, -2.7, 2.7),
+                   reach: HEAVY_SWING_REACH };
     }
     return p;
   }
@@ -417,6 +482,7 @@ export class Game {
       attacker = m2.ref; victim = m1.ref; part = m1.part;
     }
     if (!attacker) return;
+    attacker.markSwingLanded();   // blade met flesh — the swing is no whiff
 
     const who = attacker === this.player ? 'player' : 'enemy';
     if (this._hitCd[who] > 0) return;
@@ -456,7 +522,9 @@ export class Game {
     if (dead) {
       this._showLabel(who === 'player' ? 'FATAL BLOW!' : 'SLAIN!', '#e74c3c');
     } else if (severed) {
+      // Losing a limb ends the bout — fell the victim so the win/lose check fires.
       this._showLabel(`${part.replace(/_/g, ' ').toUpperCase()} SEVERED!`, '#e74c3c');
+      if (victim.alive) victim._die();
     }
   }
 
@@ -482,6 +550,8 @@ export class Game {
   // deflection reads as a real parry rather than being instantly re-aimed.
   _swordClash(a, b) {
     if (!a.swordBody || !b.swordBody) return;
+    a.markSwingLanded();          // blades touched — neither swing is a whiff
+    b.markSwingLanded();
 
     const rel = a.swordStrikeVelocity().sub(b.swordStrikeVelocity()).length();
     if (rel < 2.5) return;            // a gentle touch, not a real clash
@@ -510,12 +580,14 @@ export class Game {
     a.swordBody.applyImpulse({ x:  nx * ja, y:  ny * ja + up, z:  nz * ja }, true);
     b.swordBody.applyImpulse({ x: -nx * jb, y: -ny * jb + up, z: -nz * jb }, true);
 
-    // A touch of spin so they twist off each other.
-    a.swordBody.applyTorqueImpulse({ x: (Math.random() - 0.5) * ja * 0.2, y: (Math.random() - 0.5) * ja * 0.2, z: (Math.random() - 0.5) * ja * 0.2 }, true);
-    b.swordBody.applyTorqueImpulse({ x: (Math.random() - 0.5) * jb * 0.2, y: (Math.random() - 0.5) * jb * 0.2, z: (Math.random() - 0.5) * jb * 0.2 }, true);
+    // A touch of spin so they twist off each other (transverse only, capped).
+    deflectSpin(a.swordBody, ja * 0.2);
+    deflectSpin(b.swordBody, jb * 0.2);
 
-    a.staggerSword(p.aStag * bP);
-    b.staggerSword(p.bStag * aP);
+    // A parried fighter is staggered longer the harder THEY swung — a parried
+    // heavy leaves its owner badly overextended.
+    a.staggerSword(p.aStag * bP * (p.parry ? Math.max(1, aP * 0.55) : 1));
+    b.staggerSword(p.bStag * aP * (p.parry ? Math.max(1, bP * 0.55) : 1));
     if (p.aStam) a.stamina = Math.max(0, a.stamina - p.aStam);
     if (p.bStam) b.stamina = Math.max(0, b.stamina - p.bStam);
 
@@ -530,6 +602,7 @@ export class Game {
   // rebounds harder off the shield and drives the shield itself back.
   _shieldBlock(attacker, defender) {
     if (!attacker.swordBody || !defender.shieldBody) return;
+    attacker.markSwingLanded();   // blade met the shield — not a whiff
     const rel = attacker.swordStrikeVelocity().length();
     if (rel < 2.5) return;            // a gentle touch, not a real strike
     if (this._clangCd > 0) return;
@@ -545,14 +618,20 @@ export class Game {
 
     const j = Math.min(8, rel * 0.5) * power;   // bounce the blade back off the shield
     attacker.swordBody.applyImpulse({ x: nx * j, y: ny * j + 0.5, z: nz * j }, true);
-    attacker.swordBody.applyTorqueImpulse({
-      x: (Math.random() - 0.5) * j * 0.3,
-      y: (Math.random() - 0.5) * j * 0.3,
-      z: (Math.random() - 0.5) * j * 0.3,
-    }, true);
+    deflectSpin(attacker.swordBody, j * 0.3);
     // Drive the shield (and the arm behind it) back along the line of the blow.
     const push = Math.min(7, rel * 0.4) * power;
     defender.shieldBody.applyImpulse({ x: -nx * push, y: -ny * push + 0.3, z: -nz * push }, true);
+
+    // The defender feels the blow THROUGH the shield in proportion to its
+    // power: the shield arm tires, and a heavy strike lurches the whole body
+    // back behind the shield instead of just flicking the disc.
+    defender.stamina = Math.max(0, defender.stamina - 8 * power);
+    const lurch = Math.min(6, rel * 0.35) * power * 0.5;
+    for (const part of ['torso', 'pelvis']) {
+      defender.bodies[part].applyImpulse({ x: -nx * lurch, y: 0, z: -nz * lurch }, true);
+    }
+    if (defender === this.player && power > 1.5) this._screenShake();
 
     attacker.staggerSword(0.4 * power);
     attacker.stamina = Math.max(0, attacker.stamina - 16);
@@ -561,7 +640,8 @@ export class Game {
       new THREE.Vector3(tb.x, tb.y + 0.2, tb.z), '#9ad0ff', power > 1 ? 22 : 20);
   }
 
-  // Flash "PARRY" above any fighter the instant it raises a block stance.
+  // Flash "PARRY" above any fighter the instant it raises a block stance, and
+  // "OVERSWUNG!" above one whose heavy swing just whiffed through empty air.
   _announceParries() {
     for (const f of [this.player, this.enemy]) {
       if (f.parrying && !f._parryAnnounced) {
@@ -569,6 +649,11 @@ export class Game {
         this._flashWorldText('PARRY', new THREE.Vector3(pp.x, pp.y + 1.0, pp.z), '#7fd0ff', 20);
       }
       f._parryAnnounced = f.parrying;
+      if (f.whiffed) {
+        f.whiffed = false;
+        const pp = f.pelvisPos();
+        this._flashWorldText('OVERSWUNG!', new THREE.Vector3(pp.x, pp.y + 1.1, pp.z), '#ff8c2a', 20);
+      }
     }
   }
 

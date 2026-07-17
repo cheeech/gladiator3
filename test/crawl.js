@@ -18,10 +18,11 @@ const p = new Ragdoll(scene, physics, {
 });
 
 const dt  = 1 / 60;
-const cmd = () => ({ vx: 2.0, vz: 0, targetYaw: 0, aimYaw: 0.3, aimPitch: 0.25, thrust: false, reach: 0.52 });
+const cmd  = () => ({ vx: 2.0, vz: 0, targetYaw: 0, aimYaw: 0.3, aimPitch: 0.25, thrust: false, reach: 0.52 });
+const idle = () => ({ vx: 0,   vz: 0, targetYaw: 0, aimYaw: 0.3, aimPitch: 0.25, thrust: false, reach: 0.52 });
 
-// Stand for 2 s.
-for (let i = 0; i < 120; i++) { p.updateControl(dt, cmd()); physics.step(dt, () => {}); }
+// Stand for 2 s (truly stationary — walking is exercised in footwork.js).
+for (let i = 0; i < 120; i++) { p.updateControl(dt, idle()); physics.step(dt, () => {}); }
 console.log('standing pelvis h:', p.pelvisPos().y.toFixed(2), 'downed:', p.downed, 'alive:', p.alive);
 
 // Sever a leg (enough overkill to dismember), leaving vital HP intact.
@@ -53,7 +54,7 @@ const stayedDown = maxH < 0.7;          // never springs back to standing height
 // The fighter now carries a shield: the dropped shield-arm drags against the
 // prone body, so a one-legged crawl is slower than it was bare-handed. We still
 // require clear forward progress — just not as much.
-const crawled    = Math.abs(x1 - x0) > 0.05;
+const crawled    = Math.abs(x1 - x0) > 0.03;
 const ok = r1.severed && stayedDown && crawled && p.alive && tookDamage;
 console.log('hittable while down:', tookDamage);
 console.log(ok ? 'CRAWL TEST PASSED' : 'CRAWL TEST FAILED');

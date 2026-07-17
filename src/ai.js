@@ -2,16 +2,24 @@
 // Swings are physical: the AI moves its sword aim target fast and the
 // PD controller in the ragdoll does the actual swinging.
 
+// Cuts chamber well past the shoulder line (yaw ~120°) so the blade visibly
+// swivels back behind the body before sweeping, and the strike carries through
+// past centre — without this the swing reads as a poke.
 const SWING_STYLES = [
-  { name: 'cut_r',    windup: { yaw: -1.4, pitch:  0.45 }, strike: { yaw:  1.2, pitch:  0.0  } },
-  { name: 'cut_l',    windup: { yaw:  1.4, pitch:  0.45 }, strike: { yaw: -1.2, pitch:  0.0  } },
-  { name: 'overhead', windup: { yaw:  0.1, pitch:  1.25 }, strike: { yaw:  0.0, pitch: -0.55 } },
-  { name: 'thrust',   windup: { yaw:  0.0, pitch:  0.15 }, strike: { yaw:  0.0, pitch:  0.10 }, thrust: true },
-  { name: 'low_r',    windup: { yaw: -1.3, pitch: -0.20 }, strike: { yaw:  1.1, pitch: -0.85 } },
-  { name: 'low_l',    windup: { yaw:  1.3, pitch: -0.20 }, strike: { yaw: -1.1, pitch: -0.85 } },
+  { name: 'cut_r',    windup: { yaw: -2.1, pitch:  0.45 }, strike: { yaw:  1.45, pitch:  0.0  } },
+  { name: 'cut_l',    windup: { yaw:  2.1, pitch:  0.45 }, strike: { yaw: -1.45, pitch:  0.0  } },
+  { name: 'overhead', windup: { yaw:  0.1, pitch:  1.25 }, strike: { yaw:  0.0,  pitch: -0.55 } },
+  { name: 'thrust',   windup: { yaw:  0.0, pitch:  0.15 }, strike: { yaw:  0.0,  pitch:  0.10 }, thrust: true },
+  { name: 'low_r',    windup: { yaw: -2.0, pitch: -0.20 }, strike: { yaw:  1.35, pitch: -0.85 } },
+  { name: 'low_l',    windup: { yaw:  2.0, pitch: -0.20 }, strike: { yaw: -1.35, pitch: -0.85 } },
 ];
 
 const GUARD = { yaw: 0.35, pitch: 0.25 };
+// Windup arc: the aim doesn't lerp straight to the chamber pose — it travels a
+// time-parametrized curve (smoothstep, so it starts and arrives gently) with
+// the pitch lifted mid-path, so the tip circles up-and-over BACKWARD into the
+// chamber (a moulinet) instead of snapping sideways along a chord.
+const WINDUP_ARC_LIFT = 0.5;   // extra pitch at the arc's midpoint (rad)
 // Block stances: a spectrum of guards the AI throws when parrying — centred
 // high, swept out to either side, dropped low, or raised overhead — so blocks
 // read as a real, varied defence rather than one canned pose.
@@ -35,14 +43,16 @@ const DODGE_RANGE       = 2.0;   // only dash if the foe is this close
 const DODGE_CHANCE      = 0.4;   // chance to react to any given incoming strike
 const PARRY_CHANCE      = 0.45;  // of reactions, the share that block instead of dash
 const PARRY_HOLD        = 0.45;  // s to hold the block stance
-// Heavy swing: occasionally the AI loads a big committed blow — longer windup,
-// a much wider arc, extra reach and stamina, far more damage, and a harder
-// knock-back when blocked. Mirrors the player's charged heavy attack.
+// Heavy swing: occasionally the AI loads a big committed blow — a long,
+// telegraphed windup, a huge arc, extra reach, a big stamina dump, and far
+// more damage. Mirrors the player's charged heavy attack, risks included:
+// if the blade touches nothing the ragdoll's whiff detector staggers the AI
+// too, and a parried/blocked heavy staggers it in proportion to its power.
 const HEAVY_CHANCE      = 0.30;  // share of swings that are heavy
-const HEAVY_POWER       = 2.2;   // damage / knockback multiplier (matches game.js)
-const HEAVY_STAM_COST   = 32;    // stamina committed to a heavy swing
-const HEAVY_SWING_REACH = 0.98;  // arm extends much further on the heavy strike
-const HEAVY_YAW_MUL     = 1.6;   // widens the swing arc
+const HEAVY_POWER       = 3.2;   // damage / knockback multiplier (matches game.js)
+const HEAVY_STAM_COST   = 45;    // stamina committed to a heavy swing
+const HEAVY_SWING_REACH = 1.02;  // arm extends much further on the heavy strike
+const HEAVY_YAW_MUL     = 2.1;   // widens the swing arc
 // Periodic ducking — every so often the fighter drops into a crouch for a beat,
 // so an AI-vs-AI bout (watch mode) shows the full vertical range of movement.
 const DUCK_PERIOD_MIN   = 2.2;   // s between ducks
@@ -60,6 +70,8 @@ export class EnemyAI {
     this.style  = null;
     this.heavy  = false;               // true while loading/landing a heavy swing
     this.parryPose = PARRY_POSES[0];   // chosen fresh on each block
+    this.windupFrom = { yaw: GUARD.yaw, pitch: GUARD.pitch };  // arc start pose
+    this.windupDur  = 0.3;             // duration of the current windup arc
     this.duck      = 0;                // smoothed crouch amount (0..1)
     this.ducking   = false;
     this.duckDir   = 1;                // which way the current duck weaves (±1)
@@ -129,21 +141,35 @@ export class EnemyAI {
           // Sometimes commit to a heavy swing (if there's stamina to spend).
           this.heavy = Math.random() < HEAVY_CHANCE && this.enemy.stamina > HEAVY_STAM_COST;
           this.state = 'WINDUP';
-          this.timer = (this.heavy ? 0.5 : 0.30) + Math.random() * 0.20;
+          // A heavy's long cock-back is its telegraph — the foe gets time to read it.
+          this.timer = (this.heavy ? 0.75 : 0.38) + Math.random() * 0.20;
+          this.windupFrom = { yaw: this.aimYaw, pitch: this.aimPitch };
+          this.windupDur  = this.timer;
         }
         break;
       }
 
-      case 'WINDUP':
+      case 'WINDUP': {
         // Plant somewhat and step into range, but keep a little lateral motion.
         ({ vx, vz } = this._circleStep(ux, uz, px, pz, ENGAGE_DIST * 0.85, dist, 0.35));
-        this._aimToward(this._heavyize(this.style.windup), dt, 9);
+        // Ride the windup arc: smoothstep from the pose the swing started at to
+        // the chamber, tip lifted mid-path so it circles over-and-back.
+        const wp = this._heavyize(this.style.windup, true);
+        const s  = 1 - Math.max(0, this.timer) / this.windupDur;
+        const e  = s * s * (3 - 2 * s);
+        const lift = WINDUP_ARC_LIFT * Math.sin(Math.PI * e);
+        this._aimToward({
+          yaw:   this.windupFrom.yaw + (wp.yaw - this.windupFrom.yaw) * e,
+          pitch: Math.min(2.0, this.windupFrom.pitch + (wp.pitch - this.windupFrom.pitch) * e + lift),
+        }, dt, 16);
+        reach = this.heavy ? 0.30 : 0.38;   // hands in tight for the backswing
         if (this.timer <= 0) {
           this.state = 'SWING';
-          this.timer = this.heavy ? 0.34 : 0.26;
+          this.timer = this.heavy ? 0.42 : 0.26;   // the huge arc sweeps longer
           if (this.heavy) this.enemy.stamina = Math.max(0, this.enemy.stamina - HEAVY_STAM_COST);
         }
         break;
+      }
 
       case 'SWING':
         // Commit forward into the cut so the blade actually reaches — harder on
@@ -192,10 +218,23 @@ export class EnemyAI {
              thrust, power, reach, crouch: this.duck };
   }
 
-  // Widen a swing pose's arc when the current swing is heavy.
-  _heavyize(pose) {
+  // Widen a swing pose's arc when the current swing is heavy. The windup pose
+  // becomes a golf-style backswing: the tip sweeps back behind the shoulder
+  // and up while the hands stay in tight (see the matching player transform
+  // in game._swingPoses).
+  _heavyize(pose, windup = false) {
     if (!this.heavy) return pose;
-    return { yaw: pose.yaw * HEAVY_YAW_MUL, pitch: pose.pitch };
+    // Clamp short of π — past it the scalar aim lerp sweeps the long way round.
+    if (!windup) return {
+      yaw:   Math.max(-2.7, Math.min(2.7, pose.yaw * HEAVY_YAW_MUL)),
+      pitch: pose.pitch,
+    };
+    if (pose.pitch >= 1.1)                    // vertical swing: cock over the back
+      return { yaw: pose.yaw * 1.7, pitch: 1.95 };
+    return {                                  // side/low cut: tip back and raised
+      yaw:   Math.max(-2.6, Math.min(2.6, pose.yaw * 1.7)),
+      pitch: Math.min(pose.pitch + 0.85, 1.25),
+    };
   }
 
   // Footwork velocity: keep `desired` distance (move in/out), circle sideways,

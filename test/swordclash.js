@@ -70,9 +70,39 @@ const staggeredY = bladeY();
 
 console.log('blade tip-up:  free aim:', freeY.toFixed(2), ' staggered:', staggeredY.toFixed(2), ' (settled', settledY.toFixed(2) + ')');
 
+// ── Test 3: roll spin is bled off ──────────────────────────────────────────
+// The blade's roll inertia is ~400x smaller than transverse — a clash torque
+// along the blade axis used to spin it up like a drill for seconds. The
+// controller must bleed that roll velocity fast, even while staggered.
+function rollRate() {
+  const r = player.swordBody.rotation();
+  q.set(r.x, r.y, r.z, r.w);
+  const bd = new THREE.Vector3(0, 0, 1).applyQuaternion(q);
+  const av = player.swordBody.angvel();
+  return av.x * bd.x + av.y * bd.y + av.z * bd.z;
+}
+{
+  // Set the roll component to exactly +60 (contacts from the overlapped test
+  // blades can leave tens of rad/s of roll at any given frame, so ADDING
+  // would land at an unpredictable total).
+  const r = player.swordBody.rotation();
+  q.set(r.x, r.y, r.z, r.w);
+  const bd = new THREE.Vector3(0, 0, 1).applyQuaternion(q);
+  const av = player.swordBody.angvel();
+  const r0 = av.x * bd.x + av.y * bd.y + av.z * bd.z;
+  player.swordBody.setAngvel(
+    { x: av.x + bd.x * (60 - r0), y: av.y + bd.y * (60 - r0), z: av.z + bd.z * (60 - r0) }, true);
+}
+player.staggerSword(1.0);                        // worst case: controller off
+const spunUp = Math.abs(rollRate());
+for (let i = 0; i < 30; i++) { player.updateControl(dt, neutral(Math.PI / 2)); physics.step(dt, () => {}); }
+const spunDown = Math.abs(rollRate());
+console.log('roll spin: injected', spunUp.toFixed(0), 'rad/s -> after 0.5s:', spunDown.toFixed(1), 'rad/s');
+
 const collides    = weaponContact;
 const aimsWhenFree = freeY > 0.4;                 // control raises the blade
 const heldByParry  = staggeredY < freeY - 0.3;    // stagger blocks the re-aim
-const ok = collides && aimsWhenFree && heldByParry;
+const rollBled     = spunUp > 50 && spunDown < 4; // drill-spin killed fast
+const ok = collides && aimsWhenFree && heldByParry && rollBled;
 console.log(ok ? 'SWORD CLASH TEST PASSED' : 'SWORD CLASH TEST FAILED');
 process.exit(ok ? 0 : 1);
